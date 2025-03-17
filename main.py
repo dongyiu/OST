@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import json
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, configure_logging
 
 from pdf_parser import extract_text_from_pdf
 from job_field_analyzer import JobFieldAnalyzer
@@ -22,10 +22,15 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Job Offer Data Collection Tool")
     parser.add_argument("--resume", help="Path to resume PDF file")
+    parser.add_argument("--log-mode", choices=["development", "production"], 
+                        default="development", help="Logging mode")
     
     args = parser.parse_args()
     resume_file = args.resume if args.resume else resume_path
-
+    
+    # Configure logging based on command line argument
+    configure_logging(args.log_mode)
+    
     # Check if required environment variables are set
     if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY must be set in .env file")

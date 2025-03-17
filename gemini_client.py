@@ -4,6 +4,7 @@ import google.generativeai as genai
 from config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
+reasoning_logger = logging.getLogger('reasoning')
 
 class GeminiClient:
     def __init__(self):
@@ -13,6 +14,9 @@ class GeminiClient:
         
     def generate(self, prompt, structured_output=False):
         logger.debug(f"Generating content with prompt: {prompt[:100]}...")
+        
+        # Log the AI-to-AI reasoning process
+        reasoning_logger.info(f"Prompt sent to Gemini:\n{prompt}")
         
         try:
             # If structured output is requested, modify the prompt
@@ -24,6 +28,7 @@ class GeminiClient:
             response = self.model.generate_content(prompt)
             
             logger.info("Successfully received response from Gemini")
+            reasoning_logger.info(f"Response from Gemini:\n{response.text}")
             
             # Try to clean and parse JSON responses
             if structured_output:

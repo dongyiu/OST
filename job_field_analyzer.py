@@ -1,10 +1,9 @@
-# job_field_analyzer.py
-
 import json
 import logging
 from gemini_client import GeminiClient
 
 logger = logging.getLogger(__name__)
+reasoning_logger = logging.getLogger('reasoning')
 
 class JobFieldAnalyzer:
     def __init__(self, gemini_client):
@@ -24,8 +23,8 @@ class JobFieldAnalyzer:
 
         First, determine the industry this person works in based on their experience, skills, and education.
         
-        Then, generate 10-12 quantifiable variables that would be important for someone in this industry 
-        when evaluating job offers. These should include:
+        Then, generate 10-50 quantifiable variables that would be important for someone in this industry 
+        when evaluating job offers. The amount of variables will depend on the industry. These should include:
         
         1. Compensation factors (salary, bonuses, equity, etc.)
         2. Work-life balance factors (hours, remote work, flexibility)
@@ -61,6 +60,8 @@ class JobFieldAnalyzer:
         """
         
         logger.debug("Sending resume analysis prompt to Gemini")
+        reasoning_logger.info(f"Resume analysis reasoning:\nIndustry identification and variable generation for resume")
+        
         response = self.gemini.generate(prompt, structured_output=True)
         
         try:
@@ -70,11 +71,14 @@ class JobFieldAnalyzer:
             variables = result.get("variables", [])
             
             logger.info(f"Identified industry: {industry} with {confidence}% confidence")
-            logger.info(f"Generated {len(variables)} industry-specific variables {variables}")
+            logger.info(f"Generated {len(variables)} industry-specific variables")
+            
+            # Log each variable with its name and ID for better clarity
+            variable_summary = "\n".join([f"- {v['name']} ({v['id']})" for v in variables])
+            reasoning_logger.info(f"Industry identified: {industry} with {confidence}% confidence\n\nGenerated variables:\n{variable_summary}")
             
             return result
         except json.JSONDecodeError:
             logger.error("Failed to parse analyzer response - invalid JSON")
             logger.debug(f"Raw response: {response}")
-            return None    
-        
+            return None

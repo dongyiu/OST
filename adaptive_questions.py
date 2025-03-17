@@ -1,10 +1,9 @@
-# adaptive_questions.py
-
 import json
 import logging
 from gemini_client import GeminiClient
 
 logger = logging.getLogger(__name__)
+reasoning_logger = logging.getLogger('reasoning')
 
 class AdaptiveQuestionsEngine:
     def __init__(self, gemini_client, db_manager):
@@ -51,12 +50,26 @@ class AdaptiveQuestionsEngine:
         Make sure every variable is covered by at least one question.
         """
         
+        reasoning_logger.info(f"Questions generation reasoning:\nGenerating natural questions for {industry} industry variables")
         logger.debug("Sending question generation prompt to Gemini")
+        
         response = self.gemini.generate(prompt, structured_output=True)
         
         try:
             questions = json.loads(response)
             logger.info(f"Generated {len(questions)} questions")
+            
+            # Create a mapping of variable IDs to names for better logging
+            var_id_to_name = {v["id"]: v["name"] for v in variables}
+            
+            # Log each question with the variable names it's targeting
+            question_summary = []
+            for q in questions:
+                var_names = [var_id_to_name.get(var_id, var_id) for var_id in q.get("variables_involved", [])]
+                var_str = ", ".join(var_names)
+                question_summary.append(f"- Question: {q['q']}\n  Variables: {var_str}")
+                
+            reasoning_logger.info(f"Generated {len(questions)} questions:\n\n" + "\n\n".join(question_summary))
             
             # Validate questions cover all variables
             covered_vars = set()
@@ -67,10 +80,11 @@ class AdaptiveQuestionsEngine:
             missing_vars = all_vars - covered_vars
             
             if missing_vars:
+                missing_var_names = [var_id_to_name.get(var_id, var_id) for var_id in missing_vars]
                 logger.warning(f"Missing questions for variables: {missing_vars}")
+                reasoning_logger.info(f"Warning: Missing questions for variables: {', '.join(missing_var_names)}")
                 
             return questions
         except:
             logger.error("Failed to parse questions response")
             return []
-        
