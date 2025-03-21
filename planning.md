@@ -249,7 +249,7 @@
   - Notifies user of progress and next steps
 
 # 6. Database Manager
-
+ - WE USE json database!
 - **Core Function**: Centralizes storage and retrieval of processed data from all previous components
 
 - **Primary Responsibilities**:
