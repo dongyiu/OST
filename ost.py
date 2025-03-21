@@ -1,11 +1,17 @@
+import numpy as np
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+from scipy.integrate import quad
+from scipy.optimize import minimize
+from dataclasses import dataclass
 import json
 import random
-import numpy as np
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable, Any
+import pandas as pd
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 
-# Parse user data from the provided JSON format
+# Parse user data from the provided JSON format (keeping the original function)
 def parse_user_data(data_string: str) -> dict:
     """Extract user preferences from the provided JSON data."""
     try:
@@ -76,6 +82,7 @@ class JobOffer:
     mentoring_opportunity: int  # 1-5 scale
     project_variety: int  # 1-5 scale
     team_collaboration: int  # 1-5 scale
+    negotiation_flexibility: float = 0.0  # 0-1 scale, representing room for negotiation
     
     def calculate_utility(self, preferences: dict) -> float:
         """Calculate the utility/value of this job offer based on user preferences."""
@@ -109,583 +116,1579 @@ class JobOffer:
         return f"{self.company} - £{self.salary:,.2f}/year (Career:{self.career_growth}/5, WLB:{self.work_life_balance}/5)"
 
 
-class JobMarket:
-    """Simulates a job market with various companies and positions."""
+class BayesianJobMarketModel:
+    """
+    A Bayesian model of the job market that updates beliefs based on observed offers.
+    This represents a significant advancement over the original model by learning from
+    the data as it's observed.
+    """
     
-    def __init__(self, preferences: dict, num_companies: int = 50):
+    def __init__(self, preferences: dict):
+        """
+        Initialize the Bayesian job market model with prior beliefs.
+        
+        Args:
+            preferences: User preferences for job attributes
+        """
         self.preferences = preferences
-        self.companies = [
+        
+        # Prior beliefs about job market - represented as distribution parameters
+        # We'll use Gaussian distributions for continuous variables and Beta for bounded ones
+        self.current_salary = preferences.get('current_salary', 25000)
+        
+        # Salary model - represented as a Gaussian mixture
+        # Components: below market, at market, above market, significantly above market
+        self.salary_weights = np.array([0.3, 0.4, 0.2, 0.1])  # Initial mixture weights
+        self.salary_means = np.array([
+            0.9 * self.current_salary,  # Below market
+            1.08 * self.current_salary,  # At market
+            1.2 * self.current_salary,  # Above market
+            1.4 * self.current_salary,  # Significantly above market
+        ])
+        self.salary_stds = np.array([
+            0.1 * self.current_salary,
+            0.05 * self.current_salary,
+            0.08 * self.current_salary,
+            0.15 * self.current_salary,
+        ])
+        
+        # Prior for job attributes (alpha, beta parameters for Beta distributions)
+        # Higher alpha relative to beta means we expect higher values
+        self.attribute_priors = {
+            'career_growth': (2, 2),          # Uniform prior initially
+            'location_score': (2, 2),
+            'work_life_balance': (2, 2),
+            'company_reputation': (2, 2),
+            'role_responsibilities': (2, 2),
+            'ai_component': (2, 2),
+            'tech_stack_match': (2, 2),
+            'mentoring_opportunity': (2, 2),
+            'project_variety': (2, 2),
+            'team_collaboration': (2, 2),
+        }
+        
+        # Keep observed data for updating our model
+        self.observed_salaries = []
+        self.observed_attributes = {attr: [] for attr in self.attribute_priors}
+        
+        # Market condition modeling 
+        self.market_condition = 1.0  # 1.0 means neutral market
+        self.market_volatility = 0.05  # How much market conditions change over time
+        self.seasonality_factors = [
+            1.05, 1.08, 1.10, 1.05,  # Q1: Hiring season in many industries
+            0.98, 0.95, 0.92, 0.90,  # Q2: Slowing down, budgets allocated
+            0.88, 0.90, 0.93, 0.95,  # Q3: Summer slowdown, then picking up
+            1.02, 1.08, 1.12, 1.10,  # Q4: Year-end hiring push, then holiday slowdown
+        ]
+        
+        # Strategic employer behavior model
+        self.negotiation_model = {
+            'initial_lowball_factor': 0.9,  # Initial offers are typically 90% of max
+            'candidate_desirability': 1.0,  # How desirable the candidate is (1.0 = neutral)
+            'urgency_to_fill': 0.5,         # How urgent is the position to be filled (0-1)
+            'counter_offer_improvement': 0.05,  # 5% improvement on counter offers
+        }
+        
+        # Time-variant skill improvement model
+        self.skill_growth_rate = 0.01  # 1% skill growth per unit time
+        self.last_update_time = 0
+        
+        # Learning model for interview success
+        self.interview_gp = self._initialize_gp_model()
+        self.interview_outcomes = []  # [(features, outcome), ...]
+        
+    def _initialize_gp_model(self):
+        """Initialize a Gaussian Process model for learning interview success factors."""
+        # RBF kernel with noise
+        kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
+        return GaussianProcessRegressor(kernel=kernel, alpha=1e-10)
+    
+    def update_with_offer(self, offer: JobOffer, time_point: float, was_successful: bool = None):
+        """
+        Update our model with a new observed job offer.
+        
+        Args:
+            offer: The observed job offer
+            time_point: The time point when this offer was observed (0-1 scale)
+            was_successful: Whether this job application was successful (None if not yet known)
+        """
+        # Track the salary
+        self.observed_salaries.append(offer.salary)
+        
+        # Track the attributes
+        for attr in self.attribute_priors:
+            if hasattr(offer, attr):
+                # Convert 1-5 scale to 0-1 scale for Beta distribution
+                value = getattr(offer, attr) / 5.0
+                self.observed_attributes[attr].append(value)
+        
+        # Update our Bayesian model
+        self._update_salary_model()
+        self._update_attribute_models()
+        
+        # Update market condition model
+        self._update_market_condition(time_point)
+        
+        # Update skill growth model
+        self._update_skills(time_point)
+        
+        # Update interview success model if outcome is known
+        if was_successful is not None:
+            self._update_interview_model(offer, was_successful)
+    
+    def _update_salary_model(self):
+        """Update the salary model based on observed salaries."""
+        if len(self.observed_salaries) < 2:
+            return  # Not enough data to update
+        
+        # Fit a Gaussian Mixture Model to the observed salaries
+        from sklearn.mixture import GaussianMixture
+        
+        # Reshape for scikit-learn
+        data = np.array(self.observed_salaries).reshape(-1, 1)
+        
+        # Determine number of components based on available data
+        # We need at least as many samples as components
+        n_samples = len(self.observed_salaries)
+        n_components = min(4, n_samples)  # Use at most 4 components, but no more than we have samples
+        
+        # Fit GMM with appropriate number of components
+        gmm = GaussianMixture(n_components=n_components, random_state=42)
+        gmm.fit(data)
+        
+        # Extract the updated parameters
+        self.salary_weights = gmm.weights_
+        self.salary_means = gmm.means_.flatten()
+        self.salary_stds = np.sqrt(gmm.covariances_.flatten())
+        
+        # Sort the components by mean for consistency
+        idx = np.argsort(self.salary_means)
+        self.salary_means = self.salary_means[idx]
+        self.salary_stds = self.salary_stds[idx]
+        self.salary_weights = self.salary_weights[idx]
+        
+        # If we have fewer than 4 components, pad the arrays to maintain consistent shape
+        if n_components < 4:
+            # Pad with zeros, maintaining the same structure
+            if n_components == 1:
+                # Special case for 1 component
+                self.salary_weights = np.array([0.1, 0.1, 0.1, 0.7])  # Most weight on the single observed component
+                self.salary_means = np.array([
+                    0.85 * self.salary_means[0],
+                    0.95 * self.salary_means[0],
+                    1.05 * self.salary_means[0],
+                    self.salary_means[0]
+                ])
+                self.salary_stds = np.array([
+                    self.salary_stds[0],
+                    self.salary_stds[0],
+                    self.salary_stds[0],
+                    self.salary_stds[0]
+                ])
+            else:
+                # For 2 or 3 components, extend proportionally
+                current_means = self.salary_means.copy()
+                current_stds = self.salary_stds.copy()
+                current_weights = self.salary_weights.copy()
+                
+                # Initialize full-sized arrays
+                self.salary_means = np.zeros(4)
+                self.salary_stds = np.zeros(4)
+                self.salary_weights = np.zeros(4)
+                
+                # Copy existing components
+                self.salary_means[:n_components] = current_means
+                self.salary_stds[:n_components] = current_stds
+                self.salary_weights[:n_components] = current_weights * 0.7  # Scale down to make room for synthetic components
+                
+                # Create synthetic components at the edges
+                min_mean = np.min(current_means)
+                max_mean = np.max(current_means)
+                range_mean = max_mean - min_mean
+                
+                # Fill remaining components
+                for i in range(n_components, 4):
+                    if i == n_components:
+                        # Add a component below the minimum
+                        self.salary_means[i] = min_mean - (range_mean * 0.1)
+                        self.salary_stds[i] = np.mean(current_stds)
+                        self.salary_weights[i] = 0.3 / (4 - n_components)
+                    elif i == n_components + 1 and n_components < 3:
+                        # Add a component above the maximum
+                        self.salary_means[i] = max_mean + (range_mean * 0.1)
+                        self.salary_stds[i] = np.mean(current_stds)
+                        self.salary_weights[i] = 0.3 / (4 - n_components)
+                    else:
+                        # Add a component in between
+                        self.salary_means[i] = min_mean + (range_mean * 0.5)
+                        self.salary_stds[i] = np.mean(current_stds)
+                        self.salary_weights[i] = 0.3 / (4 - n_components)
+    
+    def _update_attribute_models(self):
+        """Update the attribute models based on observed attributes."""
+        for attr, values in self.observed_attributes.items():
+            if not values:
+                continue
+                
+            # Get prior parameters
+            alpha_prior, beta_prior = self.attribute_priors[attr]
+            
+            # Convert 1-5 values to successes/failures for Beta
+            n_values = len(values)
+            successes = sum(values)  # Sum of normalized 0-1 values
+            
+            # Update the Beta parameters
+            alpha_posterior = alpha_prior + successes
+            beta_posterior = beta_prior + (n_values - successes)
+            
+            # Save the updated parameters
+            self.attribute_priors[attr] = (alpha_posterior, beta_posterior)
+    
+    def _update_market_condition(self, time_point: float):
+        """
+        Update the market condition based on time and seasonality.
+        
+        Args:
+            time_point: Time on 0-1 scale (0 = start of search, 1 = max time)
+        """
+        # Get the seasonal factor for this time
+        week_of_year = int(time_point * 52) % 52
+        season_index = (week_of_year // 3) % 16  # 16 3-week periods
+        seasonal_factor = self.seasonality_factors[season_index]
+        
+        # Add random walk component for market changes
+        random_walk = np.random.normal(0, self.market_volatility)
+        
+        # Update market condition
+        self.market_condition = max(0.5, min(1.5, 
+            self.market_condition * seasonal_factor + random_walk))
+    
+    def _update_skills(self, time_point: float):
+        """
+        Update the candidate's skills based on time passed.
+        
+        Args:
+            time_point: Current time point (0-1 scale)
+        """
+        # Calculate time passed since last update
+        time_passed = time_point - self.last_update_time
+        self.last_update_time = time_point
+        
+        # Increase the candidate desirability due to skill growth
+        # More learning happens when actively searching
+        self.negotiation_model['candidate_desirability'] *= (1 + self.skill_growth_rate * time_passed)
+    
+    def _update_interview_model(self, offer: JobOffer, success: bool):
+        """
+        Update our model of interview success probability.
+        
+        Args:
+            offer: The job offer that resulted from the interview
+            success: Whether the interview was successful
+        """
+        # Extract features from the offer that might predict interview success
+        features = [
+            offer.salary / self.current_salary,  # Normalized salary
+            offer.career_growth / 5.0,           # Normalized career growth
+            offer.company_reputation / 5.0,      # Normalized company reputation
+            offer.tech_stack_match / 5.0,        # Normalized tech stack match
+        ]
+        
+        # Add to training data
+        self.interview_outcomes.append((features, 1.0 if success else 0.0))
+        
+        # Only retrain if we have enough data
+        if len(self.interview_outcomes) >= 5:
+            X = np.array([f for f, _ in self.interview_outcomes])
+            y = np.array([o for _, o in self.interview_outcomes])
+            
+            # Train the Gaussian Process model
+            self.interview_gp.fit(X, y)
+    
+    def predict_interview_success(self, offer: JobOffer) -> float:
+        """
+        Predict the probability of success with a given job offer interview.
+        
+        Args:
+            offer: The job offer to predict success for
+            
+        Returns:
+            Probability of interview success (0-1)
+        """
+        # If we don't have enough data, return a default value
+        if len(self.interview_outcomes) < 5:
+            return 0.5
+        
+        # Extract features
+        features = np.array([[
+            offer.salary / self.current_salary,
+            offer.career_growth / 5.0,
+            offer.company_reputation / 5.0,
+            offer.tech_stack_match / 5.0,
+        ]])
+        
+        # Predict using the GP model
+        pred, std = self.interview_gp.predict(features, return_std=True)
+        
+        # Bound the prediction between 0 and 1
+        return max(0, min(1, pred[0]))
+    
+    def generate_job_offer(self, time_point: float) -> JobOffer:
+        """
+        Generate a realistic job offer based on current market model.
+        
+        Args:
+            time_point: Current time point (0-1 scale)
+            
+        Returns:
+            A generated job offer
+        """
+        # Generate company name
+        companies = [
             "TechInnovate", "DataDynamics", "CodeCraft", "ByteBuilders", "QuantumQueries",
             "CyberSolutions", "CloudCore", "AIVentures", "WebWizards", "DevDreams",
             "SystemSage", "NetNavigators", "InfoInnovators", "SoftwareSynergy", "TechTrend",
             "DigitalDomain", "ByteBrilliance", "CodeConnect", "AppArchitects", "SecuritySystems",
-            "MobileMasters", "AnalyticsAdvance", "QuantumQuest", "IntelImpact", "VirtualVanguard",
-            "BlockchainBrains", "RoboticRealm", "MachineMind", "CloudConnect", "NetworkNexus",
-            "FinTechForward", "HealthTechHub", "RetailRealm", "MediaMatrix", "EduTechExperts",
-            "GamingGenius", "SpaceSystems", "AutoTech", "SmartSolutions", "GreenCode",
-            "BioTechByte", "NanoNetworks", "EnergyEngineers", "TransportTech", "FutureFusion",
-            "MetaMatrix", "LogisticsLoop", "AgriTechAdvance", "UrbanUpgrade", "AeroAnalytics"
+            "MobileMasters", "AnalyticsAdvance", "QuantumQuest", "IntelImpact", "VirtualVanguard"
         ]
-        random.shuffle(self.companies)
-        self.num_companies = min(num_companies, len(self.companies))
+        company = random.choice(companies)
         
-    def generate_job_offer(self) -> JobOffer:
-        """Generate a random job offer based on the job market."""
-        company = self.companies[random.randint(0, self.num_companies - 1)]
+        # Generate salary from our Bayesian model
+        # First, decide which mixture component to use
+        component = np.random.choice(len(self.salary_means), p=self.salary_weights)
         
-        # Generate salary based on user's current and minimum salary
-        min_salary = self.preferences.get('min_salary', 20000)
-        current_salary = self.preferences.get('current_salary', 25000)
+        # Then generate from that normal distribution
+        mean = self.salary_means[component] * self.market_condition
+        std = self.salary_stds[component]
+        salary = max(10000, np.random.normal(mean, std))
         
-        # Most offers will be close to current salary, with a wider distribution
-        # - 30% chance of offers below current salary
-        # - 40% chance of offers up to 15% higher
-        # - 20% chance of offers 15-30% higher
-        # - 10% chance of offers 30%+ higher
-        salary_bucket = random.choices(
-            ["below", "slightly_above", "moderately_above", "significantly_above"],
-            weights=[0.3, 0.4, 0.2, 0.1]
-        )[0]
-        
-        if salary_bucket == "below":
-            # Below current salary (but still usually above minimum)
-            salary_mean = current_salary * 0.9
-            salary_std = current_salary * 0.1
-        elif salary_bucket == "slightly_above":
-            # Slightly above current
-            salary_mean = current_salary * 1.08
-            salary_std = current_salary * 0.05
-        elif salary_bucket == "moderately_above":
-            # Moderately above current
-            salary_mean = current_salary * 1.2
-            salary_std = current_salary * 0.08
-        else:
-            # Significantly above current
-            salary_mean = current_salary * 1.4
-            salary_std = current_salary * 0.15
+        # Generate job attributes from our Beta distributions
+        attributes = {}
+        for attr, (alpha, beta) in self.attribute_priors.items():
+            # Generate from Beta distribution and convert to 1-5 scale
+            value_0_1 = np.random.beta(alpha, beta)
+            value_1_5 = max(1, min(5, round(1 + 4 * value_0_1)))
+            attributes[attr] = value_1_5
             
-        salary = max(min_salary * 0.8, np.random.normal(salary_mean, salary_std))
+        # Apply strategic employer behavior
+        # If the candidate is more desirable, the salary offered might be higher
+        salary *= self.negotiation_model['candidate_desirability']
         
-        # Make job attributes more realistic by creating different company profiles
-        company_tier = random.choices(
-            ["top", "good", "average", "below_average"],
-            weights=[0.1, 0.3, 0.4, 0.2]
-        )[0]
+        # If the employer is urgent to fill, they might offer more
+        urgency_bonus = 1.0 + (0.1 * self.negotiation_model['urgency_to_fill'])
+        salary *= urgency_bonus
         
-        if company_tier == "top":
-            # Top companies tend to have better everything, but may have worse work-life balance
-            career_growth = random.choices([3, 4, 5], weights=[0.2, 0.3, 0.5])[0]
-            location_score = random.choices([3, 4, 5], weights=[0.2, 0.3, 0.5])[0]
-            work_life_balance = random.choices([1, 2, 3, 4, 5], weights=[0.2, 0.3, 0.3, 0.1, 0.1])[0]
-            company_reputation = random.choices([4, 5], weights=[0.3, 0.7])[0]
-            role_responsibilities = random.choices([3, 4, 5], weights=[0.1, 0.3, 0.6])[0]
-            ai_component = random.choices([1, 2, 3, 4, 5], weights=[0.1, 0.1, 0.2, 0.3, 0.3])[0]
-            tech_stack_match = random.choices([2, 3, 4, 5], weights=[0.1, 0.2, 0.3, 0.4])[0]
-            mentoring_opportunity = random.choices([3, 4, 5], weights=[0.2, 0.4, 0.4])[0]
-            project_variety = random.choices([2, 3, 4, 5], weights=[0.1, 0.2, 0.3, 0.4])[0]
-            team_collaboration = random.choices([3, 4, 5], weights=[0.2, 0.4, 0.4])[0]
-        elif company_tier == "good":
-            # Good companies have solid scores across the board
-            career_growth = random.choices([2, 3, 4, 5], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            location_score = random.choices([2, 3, 4, 5], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            work_life_balance = random.choices([2, 3, 4, 5], weights=[0.1, 0.2, 0.4, 0.3])[0]
-            company_reputation = random.choices([3, 4, 5], weights=[0.3, 0.5, 0.2])[0]
-            role_responsibilities = random.choices([2, 3, 4, 5], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            ai_component = random.choices([1, 2, 3, 4, 5], weights=[0.2, 0.2, 0.2, 0.3, 0.1])[0]
-            tech_stack_match = random.choices([1, 2, 3, 4, 5], weights=[0.1, 0.2, 0.3, 0.3, 0.1])[0]
-            mentoring_opportunity = random.choices([2, 3, 4, 5], weights=[0.2, 0.3, 0.3, 0.2])[0]
-            project_variety = random.choices([2, 3, 4, 5], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            team_collaboration = random.choices([2, 3, 4, 5], weights=[0.1, 0.3, 0.4, 0.2])[0]
-        elif company_tier == "average":
-            # Average companies, average scores
-            career_growth = random.choices([1, 2, 3, 4], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            location_score = random.choices([1, 2, 3, 4, 5], weights=[0.1, 0.2, 0.4, 0.2, 0.1])[0]
-            work_life_balance = random.choices([1, 2, 3, 4, 5], weights=[0.1, 0.2, 0.4, 0.2, 0.1])[0]
-            company_reputation = random.choices([2, 3, 4], weights=[0.3, 0.5, 0.2])[0]
-            role_responsibilities = random.choices([1, 2, 3, 4], weights=[0.1, 0.3, 0.4, 0.2])[0]
-            ai_component = random.choices([1, 2, 3, 4], weights=[0.3, 0.3, 0.3, 0.1])[0]
-            tech_stack_match = random.choices([1, 2, 3, 4], weights=[0.2, 0.3, 0.3, 0.2])[0]
-            mentoring_opportunity = random.choices([1, 2, 3, 4], weights=[0.2, 0.3, 0.3, 0.2])[0]
-            project_variety = random.choices([1, 2, 3, 4], weights=[0.2, 0.3, 0.3, 0.2])[0]
-            team_collaboration = random.choices([1, 2, 3, 4], weights=[0.1, 0.3, 0.4, 0.2])[0]
-        else:
-            # Below average companies
-            career_growth = random.choices([1, 2, 3], weights=[0.5, 0.3, 0.2])[0]
-            location_score = random.choices([1, 2, 3, 4, 5], weights=[0.3, 0.3, 0.2, 0.1, 0.1])[0]
-            work_life_balance = random.choices([1, 2, 3, 4, 5], weights=[0.3, 0.3, 0.2, 0.1, 0.1])[0]
-            company_reputation = random.choices([1, 2, 3], weights=[0.4, 0.4, 0.2])[0]
-            role_responsibilities = random.choices([1, 2, 3], weights=[0.4, 0.4, 0.2])[0]
-            ai_component = random.choices([1, 2, 3], weights=[0.5, 0.3, 0.2])[0]
-            tech_stack_match = random.choices([1, 2, 3], weights=[0.4, 0.4, 0.2])[0]
-            mentoring_opportunity = random.choices([1, 2, 3], weights=[0.5, 0.3, 0.2])[0]
-            project_variety = random.choices([1, 2, 3], weights=[0.5, 0.3, 0.2])[0]
-            team_collaboration = random.choices([1, 2, 3], weights=[0.4, 0.4, 0.2])[0]
+        # Employers typically lowball initial offers
+        salary *= self.negotiation_model['initial_lowball_factor']
+        
+        # Set negotiation flexibility
+        negotiation_flexibility = max(0, min(1, 
+            0.15 * (1 + self.negotiation_model['urgency_to_fill']) - 
+            0.05 * self.negotiation_model['candidate_desirability']))
             
+        # Create and return the job offer
         return JobOffer(
             company=company,
             salary=salary,
-            career_growth=career_growth,
-            location_score=location_score,
-            work_life_balance=work_life_balance,
-            company_reputation=company_reputation,
-            role_responsibilities=role_responsibilities,
-            ai_component=ai_component,
-            tech_stack_match=tech_stack_match,
-            mentoring_opportunity=mentoring_opportunity,
-            project_variety=project_variety,
-            team_collaboration=team_collaboration
+            career_growth=attributes.get('career_growth', 3),
+            location_score=attributes.get('location_score', 3),
+            work_life_balance=attributes.get('work_life_balance', 3),
+            company_reputation=attributes.get('company_reputation', 3),
+            role_responsibilities=attributes.get('role_responsibilities', 3),
+            ai_component=attributes.get('ai_component', 3),
+            tech_stack_match=attributes.get('tech_stack_match', 3),
+            mentoring_opportunity=attributes.get('mentoring_opportunity', 3),
+            project_variety=attributes.get('project_variety', 3),
+            team_collaboration=attributes.get('team_collaboration', 3),
+            negotiation_flexibility=negotiation_flexibility
         )
 
 
-class JobSearchOptimizer:
-    """Uses dynamic programming to optimize job search strategy."""
+class ContinuousTimeOST:
+    """
+    Advanced Optimal Stopping Theory implementation using continuous time stochastic 
+    processes and Bayesian updating.
+    """
     
-    def __init__(self, preferences: dict, max_weeks: int = 24):
+    def __init__(self, preferences: dict, max_time: float = 1.0, time_units: str = "years"):
+        """
+        Initialize the continuous time optimal stopping model.
+        
+        Args:
+            preferences: User preferences dictionary
+            max_time: Maximum time horizon for job search (in chosen units)
+            time_units: String description of time units (for display)
+        """
         self.preferences = preferences
-        self.job_market = JobMarket(preferences)
-        self.max_weeks = max_weeks
+        self.max_time = max_time
+        self.time_units = time_units
         
-        # Calculate weekly living expenses based on current salary
-        current_salary = preferences.get('current_salary', 25000)
-        self.weekly_expenses = current_salary / 52 * 0.6  # Assuming 60% of income goes to expenses
+        # Create job market model
+        self.job_market = BayesianJobMarketModel(preferences)
         
-        # Financial constraints
-        self.financial_runway = preferences.get('financial_runway', 3) * 4  # Convert months to weeks
+        # Financial parameters
+        self.current_salary = preferences.get('current_salary', 25000)
+        self.financial_runway = preferences.get('financial_runway', 3) / 12  # Convert months to years
+        self.discount_rate = 0.05  # Annual discount rate for future cash flows
+        
+        # Psychological parameters
         self.job_search_urgency = preferences.get('job_search_urgency', 5) / 10  # Normalize to 0-1
         self.risk_tolerance = preferences.get('risk_tolerance', 5) / 10  # Normalize to 0-1
+        self.optimism_factor = 0.5 + (self.risk_tolerance * 0.5)  # Optimism correlates with risk tolerance
         
-        # DP table: value[week] = best expected value from week to end
-        self.value_table = [0] * (max_weeks + 1)
-        # Decision table: decision[week] = min utility to accept at this week
-        self.decision_thresholds = [0] * (max_weeks + 1)
+        # Search parameters
+        self.search_cost_rate = self.current_salary * 0.05  # Cost of searching (money, effort, stress)
+        self.offer_arrival_rate = 12  # Expected number of offers per year
         
-        # Job offer history for simulation
-        self.job_offers_history = []
-        self.utilities_history = []
+        # State variables
+        self.current_time = 0.0
+        self.best_offer_so_far = None
+        self.best_utility_so_far = -float('inf')
+        self.observed_offers = []
         
-    def simulate_offers(self, num_weeks: int) -> List[Tuple[JobOffer, float]]:
-        """Simulate job offers over a specific period."""
-        offers_with_utilities = []
+        # Offer negotiation model
+        self.negotiation_success_rate = 0.7  # Probability of successful negotiation
+        self.negotiation_improvement = 0.05  # Average improvement from negotiation
         
-        for _ in range(num_weeks):
-            # Each week has a chance to receive 0-3 offers
-            num_offers = random.choices([0, 1, 2, 3], weights=[0.3, 0.4, 0.2, 0.1])[0]
-            
-            for _ in range(num_offers):
-                offer = self.job_market.generate_job_offer()
-                utility = offer.calculate_utility(self.preferences)
-                offers_with_utilities.append((offer, utility))
-                
-        return offers_with_utilities
+        # Value function approximation
+        self.time_grid = np.linspace(0, max_time, 100)
+        self.value_function = np.zeros_like(self.time_grid)
+        self.reservation_utilities = np.zeros_like(self.time_grid)
+        
+        # Initialize the value function and reservation utilities
+        self._initialize_value_function()
     
-    def calculate_optimal_strategy(self) -> None:
-        """
-        Use backward induction (dynamic programming) to calculate the optimal
-        decision threshold for each week of the job search.
-        """
-        # Value at the last week is 0 (if no job by then)
-        self.value_table[self.max_weeks] = 0
+    def _initialize_value_function(self):
+        """Initialize the value function using backward induction."""
+        # Initialize terminal value
+        self.value_function[-1] = 0
         
-        # Generate a large sample of job offers to understand the distribution
-        sample_size = 500
-        sample_offers = [self.job_market.generate_job_offer() for _ in range(sample_size)]
+        # Backward induction
+        for i in range(len(self.time_grid) - 2, -1, -1):
+            t = self.time_grid[i]
+            dt = self.time_grid[i+1] - t
+            
+            # Expected utility calculation
+            expected_improvement = self._expected_improvement_from_continuing(t)
+            
+            # Update value function, accounting for:
+            # 1. Time value of money (discounting)
+            # 2. Search costs
+            # 3. Financial runway constraints
+            # 4. Market condition changes
+            discounted_next_value = self.value_function[i+1] * np.exp(-self.discount_rate * dt)
+            search_cost = self.search_cost_rate * dt
+            
+            # Value of continuing the search
+            continuing_value = expected_improvement + discounted_next_value - search_cost
+            
+            # Adjust for financial runway
+            time_remaining_factor = max(0, (self.financial_runway - t) / self.financial_runway)
+            if time_remaining_factor <= 0:
+                # Financial pressure when runway is depleted
+                runway_penalty = search_cost * (1 + 0.5 * (1 - self.risk_tolerance))
+                continuing_value -= runway_penalty
+            
+            # Adjust for search urgency
+            urgency_adjustment = (t / self.max_time) * self.job_search_urgency * expected_improvement * 0.5
+            continuing_value -= urgency_adjustment
+            
+            # Store the continuing value
+            self.value_function[i] = continuing_value
+            
+            # Calculate the reservation utility - threshold for accepting an offer
+            self.reservation_utilities[i] = self._calculate_reservation_utility(t, continuing_value)
+    
+    def _expected_improvement_from_continuing(self, t: float) -> float:
+        """Calculate the expected improvement in utility from continuing the search."""
+        # Generate sample offers to estimate expected value
+        n_samples = 100
+        sample_offers = [self.job_market.generate_job_offer(t) for _ in range(n_samples)]
         sample_utilities = [offer.calculate_utility(self.preferences) for offer in sample_offers]
         
-        # Sort utilities to understand the distribution better
-        sorted_utilities = sorted(sample_utilities)
-        median_utility = sorted_utilities[len(sorted_utilities) // 2]
-        p75_utility = sorted_utilities[int(len(sorted_utilities) * 0.75)]
-        p90_utility = sorted_utilities[int(len(sorted_utilities) * 0.9)]
+        # If we have a best offer so far, we only benefit from better offers
+        if self.best_offer_so_far:
+            best_utility = self.best_offer_so_far.calculate_utility(self.preferences)
+            improvements = [max(0, u - best_utility) for u in sample_utilities]
+        else:
+            improvements = [max(0, u) for u in sample_utilities]
         
-        # Set a base threshold using the distribution - initially aim for top 25% of offers
-        base_threshold = p75_utility
+        # Expected improvement adjusted for arrival rate
+        arrival_prob = 1 - np.exp(-self.offer_arrival_rate * (self.max_time - t) / 100)
+        expected_improvement = np.mean(improvements) * arrival_prob
         
-        # Factor in risk tolerance - higher risk tolerance means higher initial standards
-        risk_factor = 0.5 + self.risk_tolerance  # Range from 0.5 to 1.5
-        initial_threshold = base_threshold * risk_factor
-        
-        # Weekly offer probability (realistic job search has many weeks with no offers)
-        weekly_offer_prob = 0.7  # 70% chance of getting at least one offer per week
-        avg_weekly_offers = 0.8  # Less than 1 offer per week on average
-        
-        # Backward induction from the second-last week
-        for week in range(self.max_weeks - 1, -1, -1):
-            remaining_runway = self.financial_runway - week
-            
-            # Early weeks should be more selective
-            time_factor = 1.0
-            if week < self.max_weeks * 0.2:  # First 20% of search period
-                time_factor = 1.2  # Be more selective initially
-            
-            # Increasing urgency as weeks go by and runway shrinks
-            urgency_factor = 1.0
-            if remaining_runway <= 0:
-                # High urgency once runway is depleted
-                urgency_factor = 2.0 + (abs(remaining_runway) * 0.1)  # Increases with time beyond runway
-            elif remaining_runway < 4:  # Less than a month left
-                urgency_factor = 1.5  # Moderate urgency
-            
-            # Expected utility of waiting one more week
-            continuation_value = self.value_table[week + 1]
-            
-            # Cost of continuing search beyond financial runway
-            if remaining_runway <= 0:
-                # Increasing penalty for each week beyond runway
-                penalty = self.weekly_expenses * (1 + (abs(remaining_runway) * 0.2))
-                continuation_value -= penalty * (1 - self.risk_tolerance)
-            
-            # Adjust for job search urgency
-            urgency_adjustment = (self.job_search_urgency / 10) * urgency_factor
-            
-            # Calculate the threshold for this week
-            if week == 0:  # First week should be very selective
-                threshold = initial_threshold
-            else:
-                # Gradual decrease in threshold as weeks progress
-                threshold = max(
-                    continuation_value - urgency_adjustment,
-                    initial_threshold * max(0.1, 1 - (week / self.max_weeks) * (1 + urgency_adjustment))
-                )
-            
-            # Add realistic constraints:
-            # 1. Threshold shouldn't be too negative (desperate) until very late
-            if week < self.max_weeks - 3 and threshold < 0:
-                threshold = 0
-                
-            # 2. After runway, threshold should drop significantly but not absurdly
-            if remaining_runway <= 0 and threshold < -20:
-                threshold = -20
-            
-            # Save the threshold
-            self.decision_thresholds[week] = threshold
-            
-            # Calculate probability of getting an acceptable offer this week
-            prob_getting_offer = weekly_offer_prob * avg_weekly_offers
-            prob_acceptable = sum(1 for u in sample_utilities if u > threshold) / sample_size
-            combined_prob = prob_getting_offer * prob_acceptable
-            
-            # Calculate expected value if we accept (weighted average of utilities above threshold)
-            acceptable_utilities = [u for u in sample_utilities if u > threshold]
-            if acceptable_utilities:
-                expected_value_if_accepted = sum(acceptable_utilities) / len(acceptable_utilities)
-            else:
-                expected_value_if_accepted = 0
-            
-            # Calculate the expected value of being at this week
-            self.value_table[week] = (
-                combined_prob * expected_value_if_accepted + 
-                (1 - combined_prob) * continuation_value
-            )
+        return expected_improvement
     
-    def run_simulation(self) -> Tuple[Optional[JobOffer], int, List[Dict]]:
+    def _calculate_reservation_utility(self, t: float, continuing_value: float) -> float:
         """
-        Run a simulation of the job search process using the calculated optimal strategy.
+        Calculate the reservation utility (optimal stopping threshold) at time t.
         
+        Args:
+            t: Current time point
+            continuing_value: Value of continuing the search
+            
         Returns:
-            Tuple containing the accepted job offer (if any), the week it was accepted,
-            and history of all offers with decisions.
+            The reservation utility (threshold for accepting an offer)
         """
-        self.calculate_optimal_strategy()
+        # Basic reservation utility is the value of continuing
+        reservation_utility = continuing_value
         
-        # Track both actual accepted offer and potential best offer
-        accepted_offer = None
-        accepted_week = -1
-        best_possible_offer = None
-        best_possible_utility = -float('inf')
-        history = []
+        # Adjust for time remaining
+        time_factor = 1.0
+        if t < 0.2 * self.max_time:
+            # Be more selective in early phases
+            time_factor = 1.2
+        elif t > 0.8 * self.max_time:
+            # Be less selective near the end
+            time_factor = 0.8
         
-        # Track active applications/interviews
-        active_applications = []  # List of applications in progress
+        # Adjust for financial runway
+        runway_remaining = self.financial_runway - t
+        runway_factor = 1.0
+        if runway_remaining < 0:
+            # Much less selective once runway is gone
+            runway_factor = 0.5
+        elif runway_remaining < 0.2:
+            # Somewhat less selective when runway is low
+            runway_factor = 0.8
         
-        for week in range(self.max_weeks):
-            # Process active applications - some may become offers
-            new_offers_from_apps = []
-            remaining_applications = []
+        # Adjust for market conditions (if rapidly worsening, be less selective)
+        season_idx = int((t * 52) // 3) % 16
+        current_factor = self.job_market.seasonality_factors[season_idx]
+        next_idx = (season_idx + 1) % 16
+        next_factor = self.job_market.seasonality_factors[next_idx]
+        market_trend = next_factor / current_factor
+        
+        market_factor = 1.0
+        if market_trend < 0.95:
+            # Market worsening - be less selective
+            market_factor = 0.9
+        elif market_trend > 1.05:
+            # Market improving - be more selective
+            market_factor = 1.1
+        
+        # Final adjusted reservation utility
+        adjusted_utility = reservation_utility * time_factor * runway_factor * market_factor
+        
+        # Lower bound - never accept terrible offers
+        min_acceptable = -5 * (1 - self.risk_tolerance)
+        
+        return max(min_acceptable, adjusted_utility)
+    
+    def get_reservation_utility(self, t: float) -> float:
+        """
+        Get the reservation utility (acceptance threshold) at time t.
+        
+        Args:
+            t: Current time point
             
-            for app in active_applications:
-                app["stages_remaining"] -= 1
+        Returns:
+            The reservation utility at time t
+        """
+        # Find the closest point in our grid
+        idx = np.argmin(np.abs(self.time_grid - t))
+        return self.reservation_utilities[idx]
+    
+    def should_accept_offer(self, offer: JobOffer, t: float, attempt_negotiation: bool = True) -> Tuple[bool, str]:
+        """
+        Determine whether to accept a job offer, potentially after negotiation.
+        
+        Args:
+            offer: The job offer to evaluate
+            t: Current time point
+            attempt_negotiation: Whether to attempt negotiation
+            
+        Returns:
+            Tuple of (decision, explanation)
+        """
+        # Calculate the utility of this offer
+        utility = offer.calculate_utility(self.preferences)
+        
+        # Get the reservation utility at this time
+        reservation_utility = self.get_reservation_utility(t)
+        
+        # Check if offer exceeds best so far
+        improves_on_best = False
+        if self.best_offer_so_far:
+            best_utility = self.best_offer_so_far.calculate_utility(self.preferences)
+            improves_on_best = utility > best_utility
+        else:
+            improves_on_best = utility > 0
+        
+        # If offer isn't good enough, try negotiation
+        negotiated_utility = utility
+        negotiation_message = ""
+        
+        if attempt_negotiation and offer.negotiation_flexibility > 0:
+            potential_improvement = offer.negotiation_flexibility * self.negotiation_improvement
+            if np.random.random() < self.negotiation_success_rate:
+                # Successful negotiation
+                improved_salary = offer.salary * (1 + potential_improvement)
                 
-                # Random chance of application failing at this stage
-                if random.random() < app["fail_probability"]:
-                    # Application failed/rejected
-                    continue
-                    
-                if app["stages_remaining"] <= 0:
-                    # Application turned into a job offer
-                    offer = self.job_market.generate_job_offer()
-                    utility = offer.calculate_utility(self.preferences)
-                    new_offers_from_apps.append({"offer": offer, "utility": utility, "accepted": False})
-                    self.job_offers_history.append(offer)
-                    self.utilities_history.append(utility)
+                # Create a new offer with the improved salary
+                negotiated_offer = JobOffer(
+                    company=offer.company,
+                    salary=improved_salary,
+                    career_growth=offer.career_growth,
+                    location_score=offer.location_score,
+                    work_life_balance=offer.work_life_balance,
+                    company_reputation=offer.company_reputation,
+                    role_responsibilities=offer.role_responsibilities,
+                    ai_component=offer.ai_component,
+                    tech_stack_match=offer.tech_stack_match,
+                    mentoring_opportunity=offer.mentoring_opportunity,
+                    project_variety=offer.project_variety,
+                    team_collaboration=offer.team_collaboration,
+                    negotiation_flexibility=0  # Used up flexibility
+                )
+                
+                # Calculate new utility
+                negotiated_utility = negotiated_offer.calculate_utility(self.preferences)
+                negotiation_message = f"Negotiation successful: Salary increased from £{offer.salary:,.2f} to £{improved_salary:,.2f}"
+            else:
+                negotiation_message = "Negotiation attempted but unsuccessful"
+        
+        # Decision logic
+        if negotiated_utility >= reservation_utility:
+            if improves_on_best:
+                return True, f"Accept: Utility ({negotiated_utility:.2f}) exceeds threshold ({reservation_utility:.2f}) and improves on best offer. {negotiation_message}"
+            else:
+                return True, f"Accept: Utility ({negotiated_utility:.2f}) exceeds threshold ({reservation_utility:.2f}). {negotiation_message}"
+        else:
+            if t > self.financial_runway:
+                # Financial pressure - lower standards
+                desperation_factor = 0.8
+                adjusted_threshold = reservation_utility * desperation_factor
+                
+                if negotiated_utility >= adjusted_threshold:
+                    return True, f"Accept under financial pressure: Utility ({negotiated_utility:.2f}) exceeds adjusted threshold ({adjusted_threshold:.2f}). {negotiation_message}"
+            
+            return False, f"Reject: Utility ({negotiated_utility:.2f}) below threshold ({reservation_utility:.2f}). {negotiation_message}"
+    
+    def observe_offer(self, offer: JobOffer, t: float, interview_successful: bool = None):
+        """
+        Observe a new job offer and update our models.
+        
+        Args:
+            offer: The observed job offer
+            t: Time when the offer was observed
+            interview_successful: Whether the interview was successful (if known)
+        """
+        # Update our current time
+        self.current_time = t
+        
+        # Store the offer
+        self.observed_offers.append((offer, t))
+        
+        # Update our job market model
+        self.job_market.update_with_offer(offer, t, interview_successful)
+        
+        # Track best offer so far
+        utility = offer.calculate_utility(self.preferences)
+        if utility > self.best_utility_so_far:
+            self.best_offer_so_far = offer
+            self.best_utility_so_far = utility
+        
+        # Recalculate our value function with updated information
+        self._initialize_value_function()
+    
+    def plot_strategy(self):
+        """Plot the job search strategy and offers."""
+        plt.figure(figsize=(12, 8))
+        
+        # Plot reservation utility curve
+        plt.plot(self.time_grid, self.reservation_utilities, 'b-', label='Reservation Utility')
+        
+        # Plot value function
+        plt.plot(self.time_grid, self.value_function, 'g--', label='Value of Continuing Search')
+        
+        # Plot financial runway
+        plt.axvline(x=self.financial_runway, color='r', linestyle='--', 
+                   label=f'Financial Runway ({self.financial_runway:.2f} {self.time_units})')
+        
+        # Plot observed offers
+        if self.observed_offers:
+            offer_times = [t for _, t in self.observed_offers]
+            offer_utilities = [o.calculate_utility(self.preferences) for o, _ in self.observed_offers]
+            plt.scatter(offer_times, offer_utilities, color='orange', s=50, label='Observed Offers')
+            
+            # Highlight best offer
+            if self.best_offer_so_far:
+                best_utility = self.best_utility_so_far
+                idx = offer_utilities.index(best_utility)
+                plt.scatter([offer_times[idx]], [best_utility], color='green', s=100, 
+                           label=f'Best Offer: {self.best_offer_so_far.company}')
+        
+        # Add seasonality effect on secondary axis
+        ax1 = plt.gca()
+        ax2 = ax1.twinx()
+        
+        # Convert seasonality to continuous function
+        season_t = np.linspace(0, 1, 16)
+        season_values = self.job_market.seasonality_factors
+        season_interp = np.interp(np.linspace(0, 1, 100), season_t, season_values)
+        
+        # Repeat the seasonality for the full time scale
+        repeated_seasons = np.tile(season_interp, int(np.ceil(self.max_time)))[:len(self.time_grid)]
+        ax2.plot(self.time_grid, repeated_seasons, 'k:', alpha=0.5, label='Market Seasonality')
+        ax2.set_ylabel('Market Condition Factor')
+        ax2.set_ylim(0.8, 1.2)
+        
+        # Legends and labels
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
+        
+        plt.title('Continuous-Time Optimal Stopping Strategy for Job Search')
+        plt.xlabel(f'Time ({self.time_units})')
+        plt.ylabel('Utility')
+        plt.grid(True, alpha=0.3)
+        
+        return plt
+    
+    def get_strategy_summary(self) -> Dict:
+        """Generate a summary of the search strategy."""
+        # Divide the time horizon into phases
+        early_phase = self.time_grid[self.time_grid < 0.33 * self.max_time]
+        mid_phase = self.time_grid[(self.time_grid >= 0.33 * self.max_time) & 
+                                  (self.time_grid < 0.67 * self.max_time)]
+        late_phase = self.time_grid[self.time_grid >= 0.67 * self.max_time]
+        
+        # Get corresponding utilities
+        early_utils = [self.get_reservation_utility(t) for t in early_phase]
+        mid_utils = [self.get_reservation_utility(t) for t in mid_phase]
+        late_utils = [self.get_reservation_utility(t) for t in late_phase]
+        
+        # Analyze
+        early_avg = np.mean(early_utils) if early_utils else 0
+        mid_avg = np.mean(mid_utils) if mid_utils else 0
+        late_avg = np.mean(late_utils) if late_utils else 0
+        
+        utility_decline_rate = (early_avg - late_avg) / self.max_time if self.max_time > 0 else 0
+        
+        # Create runway milestones
+        runway_reached_time = min(self.financial_runway, self.max_time)
+        runway_threshold = self.get_reservation_utility(runway_reached_time)
+        
+        return {
+            "initial_threshold": self.reservation_utilities[0],
+            "final_threshold": self.reservation_utilities[-1],
+            "early_phase_avg_threshold": early_avg,
+            "mid_phase_avg_threshold": mid_avg,
+            "late_phase_avg_threshold": late_avg,
+            "threshold_decline_rate": utility_decline_rate,
+            "financial_runway_time": self.financial_runway,
+            "financial_runway_threshold": runway_threshold,
+            "best_utility_so_far": self.best_utility_so_far if self.best_utility_so_far > -float('inf') else None,
+            "market_condition": self.job_market.market_condition,
+            "candidate_desirability": self.job_market.negotiation_model['candidate_desirability'],
+        }
+
+
+class AdvancedJobSearchOptimizer:
+    """
+    Advanced job search optimizer that integrates continuous-time OST with
+    Bayesian updating and strategic interactions.
+    """
+    
+    def __init__(self, preferences: dict, max_time: float = 1.0, time_units: str = "years"):
+        """
+        Initialize the advanced job search optimizer.
+        
+        Args:
+            preferences: User preferences dictionary
+            max_time: Maximum time for job search
+            time_units: Units for time (for display)
+        """
+        self.preferences = preferences
+        self.max_time = max_time
+        self.time_units = time_units
+        
+        # Create the OST model
+        self.ost = ContinuousTimeOST(preferences, max_time, time_units)
+        
+        # Tracking variables
+        self.current_time = 0.0
+        self.accepted_offer = None
+        self.accepted_time = None
+        self.search_history = []
+        
+        # Decision variables
+        self.application_strategy = {
+            'time_per_application': 0.01,  # Time units spent per application
+            'max_concurrent': 5,  # Maximum number of concurrent applications
+            'success_probability': 0.3,  # Base probability of successful application
+        }
+        
+        # Active applications
+        self.active_applications = []  # [{company, start_time, progress, ...}]
+        
+        # For access in methods
+        self.time_grid = self.ost.time_grid
+        self.value_function = self.ost.value_function
+    
+    def strategic_search_step(self, time_step: float = 0.05):
+        """
+        Execute a strategic job search step, including:
+        1. Processing active applications
+        2. Starting new applications
+        3. Evaluating offers
+        4. Updating search strategy
+        
+        Args:
+            time_step: Amount of time to simulate in this step
+            
+        Returns:
+            Dictionary with information about this step
+        """
+        start_time = self.current_time
+        end_time = min(self.max_time, start_time + time_step)
+        self.current_time = end_time
+        
+        # Dictionary to store information about this step
+        step_info = {
+            'start_time': start_time,
+            'end_time': end_time,
+            'time_step': time_step,
+            'offers_received': [],
+            'applications_started': [],
+            'applications_rejected': [],
+            'applications_completed': [],
+            'negotiation_attempts': [],
+            'decisions': [],
+            'strategy_updates': [],
+            'reservation_utility': self.ost.get_reservation_utility(start_time),
+        }
+        
+        # 1. Process existing applications
+        self._process_applications(time_step, step_info)
+        
+        # 2. Generate new applications if capacity allows
+        if len(self.active_applications) < self.application_strategy['max_concurrent']:
+            self._generate_applications(time_step, step_info)
+        
+        # 3. Update search strategy based on new information
+        self._update_search_strategy(step_info)
+        
+        # Add to search history
+        self.search_history.append(step_info)
+        
+        return step_info
+    
+    def _process_applications(self, time_step: float, step_info: Dict):
+        """Process active applications, advancing them or generating offers."""
+        still_active = []
+        
+        for app in self.active_applications:
+            # Advance progress
+            app['progress'] += time_step / self.application_strategy['time_per_application']
+            
+            # Check for completion or rejection
+            if app['progress'] >= 1.0:
+                # Application process complete - determine if successful
+                success_prob = app['base_success_prob'] * self.ost.job_market.negotiation_model['candidate_desirability']
+                
+                # Apply market condition factor to success probability
+                market_factor = self.ost.job_market.market_condition
+                adjusted_success_prob = success_prob * market_factor
+                
+                # Generate a detailed reason for success/failure
+                company_tier = "top" if app['offer_model'].company_reputation >= 4 else \
+                              "good" if app['offer_model'].company_reputation >= 3 else \
+                              "average" if app['offer_model'].company_reputation >= 2 else "below_average"
+                
+                tech_match = app['offer_model'].tech_stack_match
+                
+                # Random failure scenarios for rejections
+                failure_scenarios = [
+                    f"Not enough experience for the {company_tier}-tier company",
+                    f"Another candidate was a better fit for {app['company']}'s needs",
+                    f"Limited technical match (your tech stack match was {tech_match}/5)",
+                    f"Cultural fit concerns after the final interview round",
+                    f"Position was filled internally or put on hold",
+                    f"Budgetary constraints led to a hiring freeze",
+                    f"Organizational restructuring affected the hiring process"
+                ]
+                
+                success_scenarios = [
+                    f"Strong interview performance impressed the hiring team",
+                    f"Your background aligned well with {app['company']}'s needs",
+                    f"Your tech stack expertise was highly valued (match: {tech_match}/5)",
+                    f"Good rapport with the hiring manager during interviews",
+                    f"Company is actively expanding and needs to fill positions quickly"
+                ]
+                
+                # Determine outcome first
+                is_success = np.random.random() < adjusted_success_prob
+                
+                # Select reason based on outcome
+                if is_success:
+                    reason = random.choice(success_scenarios)
                 else:
-                    # Application still in progress
-                    remaining_applications.append(app)
-            
-            active_applications = remaining_applications
-            
-            # Generate new applications for this week
-            # Weeks without new application opportunities simulate "ghosting" or dry spells
-            has_new_applications = random.random() < 0.8  # 80% chance of finding new opportunities
-            
-            if has_new_applications:
-                num_new_applications = random.choices([1, 2, 3], weights=[0.5, 0.3, 0.2])[0]
+                    reason = random.choice(failure_scenarios)
                 
-                for _ in range(num_new_applications):
-                    # Create a new application with random number of stages (interviews, etc)
-                    stages = random.choices([1, 2, 3, 4], weights=[0.2, 0.4, 0.3, 0.1])[0]
-                    fail_prob = random.uniform(0.3, 0.6)  # 30-60% chance of failing at each stage
+                if is_success:
+                    # Success - generate a job offer
+                    offer = self.ost.job_market.generate_job_offer(self.current_time)
                     
-                    active_applications.append({
-                        "stages_remaining": stages,
-                        "fail_probability": fail_prob
+                    # Use the company name from the application
+                    offer.company = app['company']
+                    
+                    # Record the offer with detailed attributes
+                    step_info['offers_received'].append({
+                        'company': offer.company,
+                        'salary': offer.salary,
+                        'attributes': {
+                            'career_growth': offer.career_growth,
+                            'work_life_balance': offer.work_life_balance,
+                            'company_reputation': offer.company_reputation,
+                            'role_responsibilities': offer.role_responsibilities,
+                            'ai_component': offer.ai_component,
+                            'tech_stack_match': offer.tech_stack_match,
+                            'mentoring_opportunity': offer.mentoring_opportunity,
+                            'project_variety': offer.project_variety,
+                            'team_collaboration': offer.team_collaboration
+                        },
+                        'negotiation_flexibility': offer.negotiation_flexibility,
+                        'success_reason': reason
                     })
-            
-            # Check if we've run out of financial runway
-            runway_status = ""
-            if week > self.financial_runway and accepted_offer is None:
-                runway_status = "FINANCIAL RUNWAY DEPLETED"
+                    
+                    # Update our OST model with this offer
+                    self.ost.observe_offer(offer, self.current_time, True)
+                    
+                    # Decide whether to accept
+                    should_accept, explanation = self.ost.should_accept_offer(offer, self.current_time)
+                    
+                    # Record decision with detailed explanation
+                    decision_info = {
+                        'offer': offer.company,
+                        'salary': offer.salary,
+                        'utility': offer.calculate_utility(self.preferences),
+                        'threshold': self.ost.get_reservation_utility(self.current_time),
+                        'decision': 'accept' if should_accept else 'reject',
+                        'explanation': explanation,
+                        'offer_details': {
+                            'career_growth': offer.career_growth,
+                            'work_life_balance': offer.work_life_balance,
+                            'company_reputation': offer.company_reputation,
+                            'role_responsibilities': offer.role_responsibilities,
+                            'ai_component': offer.ai_component,
+                            'tech_stack_match': offer.tech_stack_match
+                        }
+                    }
+                    
+                    # Add specific reasons for rejection if applicable
+                    if not should_accept:
+                        low_attributes = []
+                        for attr, value in decision_info['offer_details'].items():
+                            weight_key = f"{attr}_weight" if attr != "ai_component" else "ai_application_interest"
+                            weight = self.preferences.get(weight_key, 3)
+                            if weight >= 4 and value <= 2:  # High importance but low score
+                                low_attributes.append(f"{attr.replace('_', ' ')} is only {value}/5 but importance is {weight}/5")
+                        
+                        if low_attributes:
+                            decision_info['low_attributes'] = low_attributes
+                    
+                    step_info['decisions'].append(decision_info)
+                    
+                    # If accepting, end the search
+                    if should_accept:
+                        self.accepted_offer = offer
+                        self.accepted_time = self.current_time
+                else:
+                    # Rejection
+                    step_info['applications_rejected'].append({
+                        'company': app['company'],
+                        'time_invested': app['progress'] * self.application_strategy['time_per_application'],
+                        'reason': reason,
+                        'market_factor': market_factor
+                    })
+                    
+                    # Update our OST model with this rejection
+                    self.ost.job_market.update_with_offer(app['offer_model'], self.current_time, False)
                 
-            # Sometimes, get direct offers (recruiters reaching out, etc.)
-            direct_offers = []
-            has_direct_offers = random.random() < 0.3  # 30% chance of direct offers
-            
-            if has_direct_offers:
-                num_direct_offers = random.choices([1, 2], weights=[0.8, 0.2])[0]
-                
-                for _ in range(num_direct_offers):
-                    offer = self.job_market.generate_job_offer()
-                    utility = offer.calculate_utility(self.preferences)
-                    direct_offers.append({"offer": offer, "utility": utility, "accepted": False})
-                    self.job_offers_history.append(offer)
-                    self.utilities_history.append(utility)
-            
-            # Combine all offers for this week
-            offers_this_week = new_offers_from_apps + direct_offers
-            
-            # If we have offers, check against our threshold
-            threshold = self.decision_thresholds[week]
-            
-            best_offer = None
-            best_utility = -float('inf')
-            offer_explanations = []
-            
-            for offer_data in offers_this_week:
-                offer = offer_data["offer"]
-                utility = offer_data["utility"]
-                
-                # Create explanation for this offer
-                explanation = {
-                    "company": offer.company,
-                    "salary": offer.salary,
-                    "utility": utility,
-                    "threshold": threshold,
-                    "verdict": "Below threshold" if utility <= threshold else "Above threshold"
+                # Record completion with detailed information
+                outcome = 'offer' if is_success else 'rejection'
+                completion_info = {
+                    'company': app['company'],
+                    'outcome': outcome,
+                    'time_invested': app['progress'] * self.application_strategy['time_per_application'],
+                    'company_tier': company_tier,
+                    'tech_match': tech_match,
+                    'success_probability': f"{adjusted_success_prob:.1%}",
+                    'reason': reason
                 }
-                
-                # Add more explanation details
-                if utility <= threshold:
-                    gap = threshold - utility
-                    explanation["reason"] = f"Rejected: Utility score {utility:.2f} is {gap:.2f} points below current threshold of {threshold:.2f}"
-                    explanation["details"] = []
                     
-                    # Identify weaknesses in the offer
-                    if offer.salary < self.preferences.get('min_salary', 20000):
-                        explanation["details"].append(f"Salary (£{offer.salary:,.2f}) is below minimum acceptable (£{self.preferences.get('min_salary', 20000):,.2f})")
-                    
-                    # Check low scores in high-priority areas
-                    for attr, weight_key in [
-                        ("career_growth", "career_growth_weight"),
-                        ("work_life_balance", "work_life_balance_weight"),
-                        ("mentoring_opportunity", "mentoring_opportunity_weight"),
-                        ("project_variety", "project_variety_weight"),
-                        ("team_collaboration", "team_collaboration_weight")
-                    ]:
-                        weight = self.preferences.get(weight_key, 3)
-                        if weight >= 4 and getattr(offer, attr) <= 2:
-                            explanation["details"].append(f"Low {attr.replace('_', ' ')} score ({getattr(offer, attr)}/5) in a high-priority area")
-                else:
-                    explanation["reason"] = f"Acceptable: Utility score {utility:.2f} exceeds threshold of {threshold:.2f}"
-                    
-                    # Compare to accepted offer if we have one
-                    if accepted_offer:
-                        accepted_utility = accepted_offer.calculate_utility(self.preferences)
-                        if utility > accepted_utility:
-                            explanation["comparison"] = f"Better than current accepted offer ({utility:.2f} vs {accepted_utility:.2f})"
-                        else:
-                            explanation["comparison"] = f"Not better than current accepted offer ({utility:.2f} vs {accepted_utility:.2f})"
-                            explanation["verdict"] = "Below current best"
-                
-                offer_explanations.append(explanation)
-                
-                # Track the best offer we've ever seen (for post-analysis)
-                if utility > best_possible_utility:
-                    best_possible_offer = offer
-                    best_possible_utility = utility
-                
-                if utility > best_utility:
-                    best_offer = offer
-                    best_utility = utility
+                step_info['applications_completed'].append(completion_info)
+            else:
+                # Application still in progress
+                still_active.append(app)
+        
+        # Update active applications
+        self.active_applications = still_active
+    
+    def _generate_applications(self, time_step: float, step_info: Dict):
+        """Generate new job applications based on current strategy."""
+        # Calculate number of new applications to start
+        capacity = self.application_strategy['max_concurrent'] - len(self.active_applications)
+        
+        # Limit by how many we can realistically start in this time step
+        max_new = int(time_step / (self.application_strategy['time_per_application'] * 0.2))
+        num_new = min(capacity, max_new)
+        
+        # Generate applications
+        for _ in range(num_new):
+            # Create a model of what the offer might look like
+            offer_model = self.ost.job_market.generate_job_offer(self.current_time)
             
-            # Determine decision and explanation
-            decision = "No offers"
-            decision_explanation = "No job offers received this week"
-            would_accept = False
+            # Adjust success probability based on company tier and candidate desirability
+            base_success_prob = self.application_strategy['success_probability']
             
-            if offers_this_week:
-                if best_offer and best_utility > threshold:
-                    # Check if it's better than any offer we've already accepted
-                    if accepted_offer is None:
-                        decision = "Would accept best offer"
-                        decision_explanation = f"This offer from {best_offer.company} exceeds our current threshold ({best_utility:.2f} > {threshold:.2f})"
-                        would_accept = True
-                    else:
-                        accepted_utility = accepted_offer.calculate_utility(self.preferences)
-                        if best_utility > accepted_utility:
-                            decision = "Would accept best offer (better than previous)"
-                            decision_explanation = f"This offer is better than our previously accepted offer ({best_utility:.2f} > {accepted_utility:.2f})"
-                            would_accept = True
-                        else:
-                            decision = "Rejected all offers"
-                            decision_explanation = f"Best offer doesn't improve on our previously accepted offer ({best_utility:.2f} vs {accepted_utility:.2f})"
-                else:
-                    decision = "Rejected all offers"
-                    if best_offer:
-                        decision_explanation = f"Best offer utility ({best_utility:.2f}) is below our current threshold ({threshold:.2f})"
-                    else:
-                        decision_explanation = "No valid offers to consider"
+            # Success probability increases with worse company reputation
+            # (easier to get offers from less prestigious companies)
+            company_factor = 1.0 + (0.1 * (6 - offer_model.company_reputation))
+            base_success_prob *= company_factor
             
-            # Special case for financial pressure
-            financial_pressure = False
-            if week >= self.financial_runway - 1 and not accepted_offer and best_offer:
-                desperation_factor = 0.7 - min(0.4, max(0, week - self.financial_runway) * 0.05)
-                adjusted_threshold = threshold * desperation_factor
-                
-                if best_utility > adjusted_threshold:
-                    decision = "Would accept under financial pressure"
-                    decision_explanation = f"Financial runway ending: accepting with reduced threshold ({adjusted_threshold:.2f} vs normal {threshold:.2f})"
-                    would_accept = True
-                    financial_pressure = True
-            
-            # Create a detailed week record
-            week_record = {
-                "week": week + 1,
-                "threshold": threshold,
-                "offers": offers_this_week,
-                "active_applications": len(active_applications),
-                "best_utility": best_utility if best_offer else None,
-                "runway_status": runway_status,
-                "decision": decision,
-                "decision_explanation": decision_explanation,
-                "offer_explanations": offer_explanations,
-                "is_accepted_week": False  # Will be updated later for the final accepted week
+            # Create application
+            app = {
+                'company': offer_model.company,
+                'start_time': self.current_time,
+                'progress': 0.0,
+                'offer_model': offer_model,
+                'base_success_prob': base_success_prob,
             }
             
-            # Actually accept the offer if appropriate
-            if would_accept:
-                # Only one offer gets truly accepted in the entire simulation
-                if accepted_offer is None or best_utility > accepted_offer.calculate_utility(self.preferences):
-                    accepted_offer = best_offer
-                    accepted_week = week
-                    for offer_data in offers_this_week:
-                        if offer_data["offer"] == best_offer:
-                            offer_data["accepted"] = True
-                    
-                    if financial_pressure:
-                        week_record["decision"] = "Accepted under financial pressure" 
-                    else:
-                        week_record["decision"] = "Accepted offer"
+            self.active_applications.append(app)
             
-            # Add this week to history
-            history.append(week_record)
-        
-        # Mark the actual accepted week in history
-        if accepted_week >= 0 and accepted_week < len(history):
-            history[accepted_week]["is_accepted_week"] = True
-        
-        # Final analysis
-        if accepted_offer:
-            accept_utility = accepted_offer.calculate_utility(self.preferences)
-            opportunity_cost = max(0, best_possible_utility - accept_utility)
-            
-            # Add opportunity cost analysis to last week record
-            if history:
-                history[-1]["opportunity_cost"] = opportunity_cost
-                history[-1]["best_possible_utility"] = best_possible_utility
-                
-                if best_possible_offer and best_possible_offer != accepted_offer:
-                    history[-1]["best_possible_offer"] = {
-                        "company": best_possible_offer.company,
-                        "salary": best_possible_offer.salary,
-                        "utility": best_possible_utility
-                    }
-        
-        return accepted_offer, accepted_week, history
+            # Record in step info
+            step_info['applications_started'].append({
+                'company': app['company'],
+                'estimated_salary': offer_model.salary,
+                'estimated_career_growth': offer_model.career_growth,
+            })
     
-    def plot_decision_thresholds(self):
-        """Plot the decision thresholds over time."""
-        # Fix: Make sure weeks and decision_thresholds have the same length
-        weeks = list(range(1, len(self.decision_thresholds) + 1))
+    def _update_search_strategy(self, step_info: Dict):
+        """Update search strategy based on evolving market model."""
+        # Get current market condition
+        market_condition = self.ost.job_market.market_condition
         
-        plt.figure(figsize=(10, 6))
-        plt.plot(weeks, self.decision_thresholds, marker='o', linestyle='-', color='blue')
-        plt.axhline(y=0, color='r', linestyle='--', alpha=0.3)
-        plt.axvline(x=self.financial_runway, color='r', linestyle='--', alpha=0.3, 
-                label=f'Financial Runway ({self.financial_runway} weeks)')
+        # Adjust max concurrent applications based on market conditions
+        if market_condition < 0.9:
+            # Poor market - apply to more places
+            new_max = min(8, self.application_strategy['max_concurrent'] + 1)
+            if new_max != self.application_strategy['max_concurrent']:
+                self.application_strategy['max_concurrent'] = new_max
+                step_info['strategy_updates'].append({
+                    'parameter': 'max_concurrent_applications',
+                    'old_value': new_max - 1,
+                    'new_value': new_max,
+                    'reason': 'Poor market conditions - increasing application volume'
+                })
+        elif market_condition > 1.1 and self.application_strategy['max_concurrent'] > 3:
+            # Good market - be more selective
+            new_max = self.application_strategy['max_concurrent'] - 1
+            self.application_strategy['max_concurrent'] = new_max
+            step_info['strategy_updates'].append({
+                'parameter': 'max_concurrent_applications',
+                'old_value': new_max + 1,
+                'new_value': new_max,
+                'reason': 'Strong market conditions - focusing on quality over quantity'
+            })
         
-        # Plot the utilities of offers if we have them
-        if self.utilities_history:
-            offer_weeks = []
-            for i in range(len(self.utilities_history)):
-                # Assuming equally distributed offers over time
-                week = 1 + int(i * len(self.decision_thresholds) / len(self.utilities_history))
-                offer_weeks.append(week)
+        # Adjust time per application as search progresses
+        runway_remaining = max(0, self.ost.financial_runway - self.current_time)
+        if runway_remaining < 0.2 and self.application_strategy['time_per_application'] > 0.005:
+            # Running out of runway - spend less time per application
+            old_value = self.application_strategy['time_per_application']
+            new_value = max(0.005, old_value * 0.9)
+            self.application_strategy['time_per_application'] = new_value
             
-            plt.scatter(offer_weeks, self.utilities_history, color='green', alpha=0.6, label='Job Offers')
+            step_info['strategy_updates'].append({
+                'parameter': 'time_per_application',
+                'old_value': old_value,
+                'new_value': new_value,
+                'reason': 'Financial pressure increasing - accelerating application process'
+            })
+    
+    def run_full_search(self, verbose=True) -> Dict:
+        """
+        Run the full job search until an offer is accepted or time runs out.
         
-        plt.title('Job Search Strategy: Utility Threshold Over Time')
-        plt.xlabel('Weeks')
-        plt.ylabel('Utility Threshold')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        Args:
+            verbose: Whether to print detailed information during the search
+            
+        Returns:
+            Dictionary with search results
+        """
+        # Reset state
+        self.current_time = 0.0
+        self.accepted_offer = None
+        self.accepted_time = None
+        self.search_history = []
+        self.active_applications = []
+        
+        if verbose:
+            print("\n===== BEGINNING JOB SEARCH SIMULATION =====")
+            print(f"Financial runway: {self.ost.financial_runway:.2f} {self.time_units}")
+            print(f"Initial reservation utility: {self.ost.get_reservation_utility(0):.2f}")
+            print(f"Job search urgency: {self.ost.job_search_urgency:.2f} (0-1 scale)")
+            print(f"Risk tolerance: {self.ost.risk_tolerance:.2f} (0-1 scale)")
+            print("Starting search process...\n")
+        
+        # Run search steps until we accept an offer or run out of time
+        step_counter = 0
+        while self.current_time < self.max_time and not self.accepted_offer:
+            step_counter += 1
+            step_info = self.strategic_search_step()
+            
+            if verbose:
+                self._print_step_details(step_counter, step_info)
+                
+                # Add pause every few steps when printing to make it easier to follow
+                if step_counter % 5 == 0:
+                    print(f"\n--- SEARCH PROGRESS: {self.current_time:.2f}/{self.max_time} {self.time_units} elapsed ---\n")
+        
+        # Compile results
+        results = {
+            'accepted_offer': None,
+            'search_duration': self.current_time,
+            'num_steps': len(self.search_history),
+            'applications_started': sum(len(step['applications_started']) for step in self.search_history),
+            'offers_received': sum(len(step['offers_received']) for step in self.search_history),
+            'rejections_received': sum(len(step['applications_rejected']) for step in self.search_history),
+            'financial_runway': self.ost.financial_runway,
+            'strategy_summary': self.ost.get_strategy_summary(),
+        }
+        
+        if self.accepted_offer:
+            results['accepted_offer'] = {
+                'company': self.accepted_offer.company,
+                'salary': self.accepted_offer.salary,
+                'career_growth': self.accepted_offer.career_growth,
+                'work_life_balance': self.accepted_offer.work_life_balance,
+                'company_reputation': self.accepted_offer.company_reputation,
+                'role_responsibilities': self.accepted_offer.role_responsibilities,
+                'utility': self.accepted_offer.calculate_utility(self.preferences),
+                'time_accepted': self.accepted_time,
+            }
+            
+            # Check if accepted within financial runway
+            results['accepted_within_runway'] = self.accepted_time <= self.ost.financial_runway
+            
+            if verbose:
+                print("\n===== OFFER ACCEPTED =====")
+                print(f"Company: {self.accepted_offer.company}")
+                print(f"Salary: £{self.accepted_offer.salary:,.2f}")
+                print(f"Career Growth: {self.accepted_offer.career_growth}/5")
+                print(f"Work-Life Balance: {self.accepted_offer.work_life_balance}/5")
+                print(f"Company Reputation: {self.accepted_offer.company_reputation}/5")
+                print(f"Role Responsibilities: {self.accepted_offer.role_responsibilities}/5")
+                print(f"AI Component: {self.accepted_offer.ai_component}/5")
+                print(f"Tech Stack Match: {self.accepted_offer.tech_stack_match}/5")
+                print(f"Mentoring Opportunity: {self.accepted_offer.mentoring_opportunity}/5")
+                print(f"Project Variety: {self.accepted_offer.project_variety}/5")
+                print(f"Team Collaboration: {self.accepted_offer.team_collaboration}/5")
+                print(f"Utility: {self.accepted_offer.calculate_utility(self.preferences):.2f}")
+                print(f"Accepted at: {self.accepted_time:.2f} {self.time_units}")
+                if results['accepted_within_runway']:
+                    print(f"Accepted within financial runway of {self.ost.financial_runway:.2f} {self.time_units}")
+                else:
+                    time_past_runway = self.accepted_time - self.ost.financial_runway
+                    print(f"Accepted {time_past_runway:.2f} {self.time_units} AFTER financial runway was depleted")
+        else:
+            if verbose:
+                print("\n===== SEARCH COMPLETED WITHOUT ACCEPTING ANY OFFER =====")
+                print(f"Searched for the entire {self.max_time} {self.time_units} without finding an acceptable offer")
+                print(f"Total applications submitted: {results['applications_started']}")
+                print(f"Total offers received: {results['offers_received']}")
+                print(f"Total rejections received: {results['rejections_received']}")
+                
+                # Report on best offer seen
+                if self.ost.best_offer_so_far:
+                    best = self.ost.best_offer_so_far
+                    print("\nBest offer encountered during search:")
+                    print(f"Company: {best.company}")
+                    print(f"Salary: £{best.salary:,.2f}")
+                    print(f"Utility: {self.ost.best_utility_so_far:.2f}")
+                    print(f"This offer was below your reservation utility threshold when received")
+        
+        if verbose:
+            self._print_search_summary(results)
+        
+        return results
+        
+    def _print_step_details(self, step_number, step_info):
+        """Print detailed information about a search step."""
+        time_point = step_info['end_time']
+        
+        print(f"STEP {step_number} - Time: {time_point:.2f} {self.time_units}")
+        
+        # Print financial status
+        runway_remaining = self.ost.financial_runway - time_point
+        if runway_remaining > 0:
+            print(f"Financial runway: {runway_remaining:.2f} {self.time_units} remaining")
+        else:
+            print(f"Financial runway: DEPLETED (exceeded by {abs(runway_remaining):.2f} {self.time_units})")
+        
+        # Print current threshold
+        current_threshold = step_info['reservation_utility']
+        print(f"Current reservation utility threshold: {current_threshold:.2f}")
+        
+        # Print market condition
+        print(f"Current market condition factor: {self.ost.job_market.market_condition:.2f}")
+        
+        # Print new applications
+        if step_info['applications_started']:
+            print("\nNew applications started:")
+            for i, app in enumerate(step_info['applications_started']):
+                print(f"  {i+1}. {app['company']} - Est. salary: £{app['estimated_salary']:,.2f}, " +
+                      f"Est. career growth: {app['estimated_career_growth']}/5")
+        else:
+            print("\nNo new applications started this period")
+        
+        # Print application rejections
+        if step_info['applications_rejected']:
+            print("\nApplications rejected:")
+            for i, rej in enumerate(step_info['applications_rejected']):
+                print(f"  {i+1}. {rej['company']} - Time invested: {rej['time_invested']:.2f} {self.time_units}")
+                print(f"     REASON: Failed during interview/assessment process")
+        
+        # Print offers received
+        if step_info['offers_received']:
+            print("\nOffers received:")
+            for i, offer in enumerate(step_info['offers_received']):
+                print(f"  {i+1}. {offer['company']} - Salary: £{offer['salary']:,.2f}")
+                print(f"     Key attributes: Career Growth: {offer['attributes']['career_growth']}/5, " +
+                      f"Work-Life Balance: {offer['attributes']['work_life_balance']}/5, " +
+                      f"Company Reputation: {offer['attributes']['company_reputation']}/5")
+                print(f"     Negotiation flexibility: {offer['negotiation_flexibility']:.2f}")
+        
+        # Print decision details
+        if step_info['decisions']:
+            print("\nDecisions made:")
+            for i, decision in enumerate(step_info['decisions']):
+                print(f"  {i+1}. {decision['offer']} - Salary: £{decision['salary']:,.2f}")
+                print(f"     Utility: {decision['utility']:.2f} vs Threshold: {decision['threshold']:.2f}")
+                print(f"     DECISION: {decision['decision'].upper()}")
+                print(f"     REASON: {decision['explanation']}")
+        
+        # Print strategy updates
+        if step_info['strategy_updates']:
+            print("\nStrategy updates:")
+            for i, update in enumerate(step_info['strategy_updates']):
+                print(f"  {i+1}. {update['parameter']}: {update['old_value']} → {update['new_value']}")
+                print(f"     REASON: {update['reason']}")
+        
+        # Print current active applications
+        active_count = len(self.active_applications)
+        if active_count > 0:
+            print(f"\nCurrently tracking {active_count} active applications")
+            for i, app in enumerate(self.active_applications):
+                progress_pct = app['progress'] * 100
+                print(f"  {i+1}. {app['company']} - Progress: {progress_pct:.1f}%")
+        
+        print("\n" + "-" * 80 + "\n")
+    
+    def _print_search_summary(self, results):
+        """Print a summary of the entire search process."""
+        print("\n===== SEARCH SUMMARY =====")
+        print(f"Search duration: {results['search_duration']:.2f} {self.time_units}")
+        print(f"Search steps: {results['num_steps']}")
+        print(f"Applications submitted: {results['applications_started']}")
+        print(f"Offers received: {results['offers_received']}")
+        print(f"Rejections received: {results['rejections_received']}")
+        
+        # Performance analysis
+        success_rate = results['offers_received'] / max(1, results['applications_started']) * 100
+        print(f"Application success rate: {success_rate:.1f}%")
+        
+        # Financial analysis
+        runway = self.ost.financial_runway
+        if results['search_duration'] <= runway:
+            print(f"Search completed with {runway - results['search_duration']:.2f} {self.time_units} of runway remaining")
+        else:
+            print(f"Search extended {results['search_duration'] - runway:.2f} {self.time_units} beyond financial runway")
+        
+        # Timeline statistics
+        timeline_buckets = 4
+        bucket_size = self.max_time / timeline_buckets
+        print("\nActivity distribution over time:")
+        
+        for i in range(timeline_buckets):
+            start_time = i * bucket_size
+            end_time = (i+1) * bucket_size
+            
+            # Count activities in this time bucket
+            applications = sum(1 for step in self.search_history 
+                            if start_time <= step['end_time'] < end_time
+                            for _ in step['applications_started'])
+            
+            offers = sum(1 for step in self.search_history 
+                        if start_time <= step['end_time'] < end_time
+                        for _ in step['offers_received'])
+            
+            rejections = sum(1 for step in self.search_history 
+                          if start_time <= step['end_time'] < end_time
+                          for _ in step['applications_rejected'])
+            
+            print(f"  Period {i+1} ({start_time:.2f}-{end_time:.2f} {self.time_units}):")
+            print(f"    Applications: {applications}, Offers: {offers}, Rejections: {rejections}")
+        
+        # Threshold evolution
+        strategy = results['strategy_summary']
+        print("\nThreshold evolution:")
+        print(f"  Initial threshold: {strategy['initial_threshold']:.2f}")
+        print(f"  Early phase avg: {strategy['early_phase_avg_threshold']:.2f}")
+        print(f"  Mid phase avg: {strategy['mid_phase_avg_threshold']:.2f}")
+        print(f"  Late phase avg: {strategy['late_phase_avg_threshold']:.2f}")
+        print(f"  Final threshold: {strategy['final_threshold']:.2f}")
+        
+        # Runway threshold
+        print(f"  Threshold at financial runway: {strategy['financial_runway_threshold']:.2f}")
+        
+        # Market conditions
+        print(f"\nFinal market condition factor: {strategy['market_condition']:.2f}")
+        print(f"Final candidate desirability: {strategy['candidate_desirability']:.2f}")
+        
+        if results['accepted_offer']:
+            accepted = results['accepted_offer']
+            # Calculate how much utility was gained compared to:
+            # 1. Initial threshold
+            utility_gain_vs_initial = accepted['utility'] - strategy['initial_threshold']
+            # 2. Theoretical continuing value at time of acceptance
+            time_of_acceptance = accepted['time_accepted']
+            idx = min(len(self.time_grid) - 1, 
+                    int(time_of_acceptance / self.max_time * (len(self.time_grid) - 1)))
+            continuing_value = self.value_function[idx]
+            utility_gain_vs_continuing = accepted['utility'] - continuing_value
+            
+            print("\nOffer analysis:")
+            print(f"  Accepted utility vs initial threshold: {utility_gain_vs_initial:+.2f}")
+            print(f"  Accepted utility vs theoretical continuing value: {utility_gain_vs_continuing:+.2f}")
+            
+            if utility_gain_vs_continuing > 0:
+                print("  CONCLUSION: Made an optimal decision to accept this offer")
+            else:
+                print("  CONCLUSION: Theoretically could have gained more by continuing search")
+                print("              but practical constraints may justify the decision")
+    
+    def plot_search_trajectory(self):
+        """Plot the complete search trajectory, including offers and decisions."""
+        plt = self.ost.plot_strategy()
+        
+        # Add specific points where decisions were made
+        decision_times = []
+        decision_utilities = []
+        decision_outcomes = []
+        
+        for step in self.search_history:
+            for decision in step.get('decisions', []):
+                decision_times.append(step['end_time'])
+                decision_utilities.append(decision['utility'])
+                decision_outcomes.append(decision['decision'])
+        
+        # Plot accept/reject decisions
+        for i, outcome in enumerate(decision_outcomes):
+            color = 'green' if outcome == 'accept' else 'red'
+            marker = 'o' if outcome == 'accept' else 'x'
+            plt.scatter([decision_times[i]], [decision_utilities[i]], 
+                       color=color, marker=marker, s=100)
+        
+        # Highlight the accepted offer if any
+        if self.accepted_offer:
+            utility = self.accepted_offer.calculate_utility(self.preferences)
+            plt.scatter([self.accepted_time], [utility], color='lime', 
+                       marker='*', s=200, label='Accepted Offer')
+        
+        # Update title
+        if self.accepted_offer:
+            plt.suptitle(f'Job Search Trajectory - Offer Accepted after {self.accepted_time:.2f} {self.time_units}')
+        else:
+            plt.suptitle(f'Job Search Trajectory - No Offer Accepted within {self.max_time} {self.time_units}')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for the title
         return plt
 
-# Function to print a simple explanation of the OST algorithm
-def explain_ost_algorithm():
+
+def explain_advanced_ost_algorithm():
+    """Explain the advanced Optimal Stopping Theory algorithm."""
     explanation = """
-===== OPTIMAL STOPPING THEORY EXPLANATION =====
+===== ADVANCED OPTIMAL STOPPING THEORY EXPLANATION =====
 
-The job search optimizer uses Optimal Stopping Theory (OST) to determine when to accept a job offer:
+This advanced job search optimizer represents a significant leap forward from basic OST implementations:
 
-1. DYNAMIC PROGRAMMING APPROACH:
-   - The algorithm works backwards from the end of the search period
-   - For each week, it calculates a "threshold utility" - the minimum value an offer needs to be accepted
-   - These thresholds decrease over time as your options narrow and financial pressure increases
+1. CONTINUOUS-TIME STOCHASTIC MODELING:
+   - Instead of discrete weeks, we model time as a continuous variable
+   - Job offers arrive as a stochastic process (Poisson arrival process)
+   - Value functions and thresholds are calculated for every point in time
+   - Financial constraints modeled as continuous functions rather than discrete steps
 
-2. UTILITY CALCULATION:
-   - Each job offer gets a utility score based on your preferences
-   - Salary, career growth, work-life balance, etc. are weighted according to your priorities
-   - The higher the utility score, the better the overall job offer
+2. BAYESIAN LEARNING MODEL:
+   - Market conditions are unknown at the start but learned through observations
+   - Each observed job offer updates our beliefs about:
+     * The distribution of salaries in the market
+     * The distribution of job attributes (work-life balance, career growth, etc.)
+     * Market seasonality and trends
+   - Model becomes more accurate as more data is gathered during the search
 
-3. DECISION RULE:
-   - Accept the first offer that exceeds your current threshold
-   - Early in the search: Be selective, only accept exceptional offers
-   - Middle of search: Become gradually less selective
-   - Near end of financial runway: Accept more marginal offers to avoid financial distress
+3. STRATEGIC INTERACTIONS WITH EMPLOYERS:
+   - Models employer negotiation strategies
+   - Considers candidate desirability and employer urgency
+   - Allows for strategic negotiation based on candidate leverage
+   - Adjusts strategies based on predicted interview success probability
 
-4. KEY FACTORS AFFECTING DECISIONS:
-   - Financial runway: How long can you afford to search?
-   - Job search urgency: How quickly do you need a new job?
-   - Risk tolerance: How willing are you to wait for better offers?
-   - Preference weights: What job factors matter most to you?
+4. NON-STATIONARY PROCESSES:
+   - Job market evolves over time (seasonal effects, market trends)
+   - Candidate skills and desirability change over time
+   - Financial pressure increases non-linearly as runway depletes
+   - Search costs and discount rates affect value of future opportunities
 
-The simulation runs through the entire search period, making realistic decisions at each point based on
-the available information. This mirrors the real-world challenge of job searching where you must decide
-whether to accept an offer or keep looking, without knowing what future offers might come.
+5. ADAPTIVE DECISION MAKING:
+   - Continuously updates optimal stopping thresholds based on new information
+   - Adapts application strategy based on market conditions and financial status
+   - Uses probability theory to balance exploration (searching) and exploitation (accepting)
+   - Considers opportunity costs of time spent searching vs. accepting suboptimal offers
+
+This model represents a theoretical optimal search strategy based on advanced stochastic control theory
+and dynamic programming. The mathematics behind it incorporate:
+
+- Martingale theory for optimal stopping problems
+- Bayesian updating for sequential decision making
+- Stochastic differential equations for continuous time processes
+- Utility theory for multi-attribute decision making
+
+The algorithm adjusts to each candidate's unique preferences and financial constraints while
+accounting for the fundamental uncertainty in job searching.
 """
-    print(explanation)
+    return explanation
+
+def run_advanced_simulation(preferences: dict, verbose_timeline=True):
+    """
+    Run an advanced job search simulation with visualizations.
+    
+    Args:
+        preferences: Dictionary of user preferences
+        verbose_timeline: Whether to print detailed step-by-step timeline
+    """
+    # Create optimizer with 1 year time horizon
+    optimizer = AdvancedJobSearchOptimizer(preferences, max_time=1.0, time_units="years")
+    
+    # Run the full search with detailed output
+    results = optimizer.run_full_search(verbose=verbose_timeline)
+    
+    # Create plots
+    plt = optimizer.plot_search_trajectory()
+    plt.savefig("advanced_job_search_trajectory.png")
+    
+    # Print simulation summary (if not already printed in verbose mode)
+    if not verbose_timeline:
+        print("\n===== ADVANCED JOB SEARCH SIMULATION RESULTS =====")
+        if results['accepted_offer']:
+            print(f"Found acceptable job offer after {results['search_duration']:.2f} years:")
+            print(f"Company: {results['accepted_offer']['company']}")
+            print(f"Salary: £{results['accepted_offer']['salary']:,.2f}")
+            print(f"Career Growth Score: {results['accepted_offer']['career_growth']}/5")
+            print(f"Work-Life Balance: {results['accepted_offer']['work_life_balance']}/5")
+            print(f"Utility: {results['accepted_offer']['utility']:.2f}")
+            
+            if results['accepted_within_runway']:
+                print(f"Accepted within financial runway ({optimizer.ost.financial_runway:.2f} years)")
+            else:
+                print(f"Accepted after financial runway depleted")
+        else:
+            print(f"No acceptable job offer found within {optimizer.max_time} years.")
+        
+        print("\n===== SEARCH STATISTICS =====")
+        print(f"Applications submitted: {results['applications_started']}")
+        print(f"Offers received: {results['offers_received']}")
+        print(f"Rejections received: {results['rejections_received']}")
+        
+        # Print strategy summary
+        strategy = results['strategy_summary']
+        print("\n===== SEARCH STRATEGY ANALYSIS =====")
+        print(f"Initial utility threshold: {strategy['initial_threshold']:.2f}")
+        print(f"Final utility threshold: {strategy['final_threshold']:.2f}")
+        print(f"Threshold decline rate: {strategy['threshold_decline_rate']:.2f} per year")
+    
+    # Print detailed application history
+    print("\n===== DETAILED APPLICATION TIMELINE =====")
+    print("* Applications submitted in chronological order:")
+    
+    # Collect all applications from the history
+    all_applications = []
+    for step in optimizer.search_history:
+        for app in step['applications_started']:
+            all_applications.append({
+                'company': app['company'],
+                'time': step['end_time'],
+                'type': 'submission',
+                'details': f"Est. salary: £{app['estimated_salary']:,.2f}, Career growth: {app['estimated_career_growth']}/5"
+            })
+        
+        for rej in step['applications_rejected']:
+            all_applications.append({
+                'company': rej['company'],
+                'time': step['end_time'],
+                'type': 'rejection',
+                'details': f"Time invested: {rej['time_invested']:.2f} years, Failed interview process"
+            })
+        
+        for offer in step['offers_received']:
+            all_applications.append({
+                'company': offer['company'],
+                'time': step['end_time'],
+                'type': 'offer',
+                'details': f"Salary: £{offer['salary']:,.2f}, Career growth: {offer['attributes']['career_growth']}/5"
+            })
+    
+    # Sort by time
+    all_applications.sort(key=lambda x: x['time'])
+    
+    # Print the timeline
+    for i, app in enumerate(all_applications):
+        time_str = f"{app['time']:.2f} years"
+        if app['type'] == 'submission':
+            print(f"{i+1}. Time {time_str}: Applied to {app['company']}")
+            print(f"   Details: {app['details']}")
+        elif app['type'] == 'rejection':
+            print(f"{i+1}. Time {time_str}: REJECTED by {app['company']}")
+            print(f"   Reason: {app['details']}")
+        elif app['type'] == 'offer':
+            print(f"{i+1}. Time {time_str}: OFFER received from {app['company']}")
+            print(f"   Details: {app['details']}")
+    
+    # Print detailed offer evaluation history
+    print("\n===== OFFER EVALUATION HISTORY =====")
+    print("* Decision process for each offer:")
+    
+    offer_decisions = []
+    for step in optimizer.search_history:
+        for decision in step.get('decisions', []):
+            offer_decisions.append({
+                'company': decision['offer'],
+                'time': step['end_time'],
+                'utility': decision['utility'],
+                'threshold': decision['threshold'],
+                'decision': decision['decision'],
+                'explanation': decision['explanation']
+            })
+    
+    for i, decision in enumerate(offer_decisions):
+        time_str = f"{decision['time']:.2f} years"
+        decision_str = decision['decision'].upper()
+        print(f"{i+1}. Time {time_str}: {decision['company']} - {decision_str}")
+        print(f"   Utility: {decision['utility']:.2f} vs Threshold: {decision['threshold']:.2f}")
+        print(f"   Reasoning: {decision['explanation']}")
+    
+    # Print explanation of advanced OST
+    print("\n" + explain_advanced_ost_algorithm())
+    
+    print("\nAdvanced job search simulation visualization saved as 'advanced_job_search_trajectory.png'")
+    
+    return results
 
 def main():
-    # Sample data string (you would replace this with actual data)
+    # Sample user preferences (same as original)
     data_string = """ "user_data": [
     {
       "question_type": "min_salary",
@@ -785,156 +1788,41 @@ def main():
     }
   ],"""
     
-    # Parse the user data
+    # Parse user preferences
     preferences = parse_user_data(data_string)
     
-    # Create optimizer and run simulation
-    optimizer = JobSearchOptimizer(preferences, max_weeks=24)
-    accepted_offer, accepted_week, history = optimizer.run_simulation()
+    print("\n" + "=" * 80)
+    print("ADVANCED OPTIMAL STOPPING THEORY JOB SEARCH SIMULATION")
+    print("=" * 80)
+    print("\nThis simulation provides a detailed view of the job search process using advanced")
+    print("Optimal Stopping Theory with Bayesian updating and continuous-time stochastic modeling.")
+    print("\nBALANCING FACTORS:")
+    print(f"- Urgency level: {preferences.get('job_search_urgency', 5)}/10 (higher means less selective)")
+    print(f"- Risk tolerance: {preferences.get('risk_tolerance', 5)}/10 (higher means more selective)")
+    print(f"- Financial runway: {preferences.get('financial_runway', 3)} months")
+    print(f"- Current salary: £{preferences.get('current_salary', 25000):,}")
+    print(f"- Minimum acceptable salary: £{preferences.get('min_salary', 20000):,}")
     
-    # Print results
-    print("\n===== JOB SEARCH OPTIMIZATION RESULTS =====")
-    if accepted_offer:
-        print(f"Found acceptable job offer in week {accepted_week + 1}:")
-        print(f"Company: {accepted_offer.company}")
-        print(f"Salary: £{accepted_offer.salary:,.2f}")
-        print(f"Career Growth Score: {accepted_offer.career_growth}/5")
-        print(f"Work-Life Balance: {accepted_offer.work_life_balance}/5")
-        
-        # Show more attributes that were important
-        top_prefs = []
-        for pref, value in preferences.items():
-            if '_weight' in pref and value >= 4:
-                top_prefs.append(pref.replace('_weight', ''))
-        
-        for pref in top_prefs:
-            attr_name = pref
-            if hasattr(accepted_offer, attr_name):
-                attr_value = getattr(accepted_offer, attr_name)
-                print(f"{attr_name.replace('_', ' ').title()}: {attr_value}/5")
-        
-        print(f"Overall Utility: {accepted_offer.calculate_utility(preferences):.2f}")
-        
-        # Show when the offer was accepted
-        if accepted_week + 1 <= optimizer.financial_runway:
-            print(f"Accepted within financial runway (Week {accepted_week + 1} of {optimizer.financial_runway} weeks)")
-        else:
-            print(f"Accepted after financial runway depleted (Week {accepted_week + 1}, {accepted_week + 1 - optimizer.financial_runway} weeks past runway)")
+    print("\nKEY PRIORITIES (rated 4-5 out of 5):")
+    priorities = []
+    for key, value in preferences.items():
+        if '_weight' in key and value >= 4:
+            name = key.replace('_weight', '').replace('_', ' ').title()
+            priorities.append(f"{name} ({value}/5)")
+    if preferences.get('ai_application_interest', 0) >= 4:
+        priorities.append(f"AI Component ({preferences.get('ai_application_interest')}/5)")
+    
+    if priorities:
+        for priority in priorities:
+            print(f"- {priority}")
     else:
-        print("No acceptable job offer found within the simulation period.")
+        print("- No strong priorities identified (all factors rated 3/5 or lower)")
     
-    # Check if there was a better offer that wasn't taken
-    if history and "best_possible_offer" in history[-1]:
-        best_offer = history[-1]["best_possible_offer"]
-        print("\n===== MISSED OPPORTUNITY ANALYSIS =====")
-        print(f"Best possible offer that appeared during search:")
-        print(f"Company: {best_offer['company']}")
-        print(f"Salary: £{best_offer['salary']:,.2f}")
-        print(f"Utility: {best_offer['utility']:.2f}")
-        
-        if accepted_offer:
-            improvement = ((best_offer['utility'] / accepted_offer.calculate_utility(preferences)) - 1) * 100
-            print(f"This would have been {improvement:.1f}% better than the accepted offer")
+    print("\nStarting simulation now. Each step represents approximately 2-3 weeks of job searching...\n")
+    print("=" * 80)
     
-    print("\n===== SEARCH PARAMETERS & STATISTICS =====")
-    print(f"Financial Runway: {preferences.get('financial_runway', 3)} months ({optimizer.financial_runway} weeks)")
-    print(f"Job Search Urgency: {preferences.get('job_search_urgency', 5)}/10")
-    print(f"Risk Tolerance: {preferences.get('risk_tolerance', 5)}/10")
-    
-    # Print historical summary
-    offers_received = sum(1 for week in history if 'offers' in week and len(week['offers']) > 0)
-    total_offers = sum(len(week.get('offers', [])) for week in history)
-    weeks_with_applications = sum(1 for week in history if 'active_applications' in week and week['active_applications'] > 0)
-    
-    print(f"\nWeeks simulated: {len(history)}")
-    print(f"Weeks with active applications: {weeks_with_applications}")
-    print(f"Weeks with offers: {offers_received}")
-    print(f"Total offers received: {total_offers}")
-    
-    if accepted_offer:
-        print(f"Offer acceptance rate: {1/total_offers:.1%} (1 out of {total_offers})")
-    else:
-        print(f"Offer acceptance rate: 0% (0 out of {total_offers})")
-    
-    # Generate detailed weekly breakdown
-    print("\n===== WEEKLY SEARCH TIMELINE =====")
-    for week_data in history:
-        week_num = week_data["week"]
-        apps = week_data.get("active_applications", 0)
-        offers = len(week_data.get("offers", []))
-        decision = week_data.get("decision", "")
-        is_accepted_week = week_data.get("is_accepted_week", False)
-        
-        status = f"Week {week_num}: "
-        if apps > 0:
-            status += f"{apps} active applications, "
-        status += f"{offers} offers received"
-        
-        # Only show ACCEPTED OFFER for the actual accepted week
-        if is_accepted_week:
-            status += f" - ACCEPTED OFFER"
-        elif week_data.get("runway_status", ""):
-            status += f" - {week_data['runway_status']}"
-            
-        print(status)
-        
-        # Print explanations when we have offers
-        if offers > 0:
-            explanation = week_data.get("decision_explanation", "")
-            if explanation:
-                print(f"   Decision: {explanation}")
-            
-            # Only print detailed offer explanations for the accepted week or weeks with interesting decisions
-            if is_accepted_week or "Would accept" in decision:
-                offer_explanations = week_data.get("offer_explanations", [])
-                for i, exp in enumerate(offer_explanations):
-                    if i > 0:  # Only show details for the first offer to avoid clutter
-                        print(f"   Offer {i+1}: {exp['company']} - £{exp['salary']:,.2f} - {exp['verdict']}")
-                    else:
-                        print(f"   Offer {i+1}: {exp['company']} - £{exp['salary']:,.2f} - {exp['verdict']}")
-                        print(f"      {exp['reason']}")
-                        if "details" in exp and exp["details"]:
-                            for detail in exp["details"][:2]:  # Limit to 2 details
-                                print(f"      - {detail}")
-                print()
-    
-    # Display the strategy plot
-    plt = optimizer.plot_decision_thresholds()
-    plt.savefig("job_search_strategy.png")
-    print("\nStrategy visualization saved as 'job_search_strategy.png'")
-    
-    # Additional tips
-    print("\n===== ADDITIONAL RECOMMENDATIONS =====")
-    if preferences.get('financial_runway', 3) < 6:
-        print("- Consider building a larger financial runway to give yourself more flexibility")
-        print("  Having only 3 months of savings significantly increases pressure to accept early offers")
-    
-    if preferences.get('job_search_urgency', 5) > 7:
-        print("- Your high job search urgency (8/10) makes you more likely to accept suboptimal offers")
-        print("  If possible, reducing this urgency would allow for a more selective search")
-    
-    print("- Focus on opportunities that align with your highest weighted preferences:")
-    top_prefs = []
-    for pref, value in preferences.items():
-        if '_weight' in pref and value >= 4:
-            top_prefs.append((pref.replace('_weight', '').replace('_', ' '), value))
-    
-    for pref, value in sorted(top_prefs, key=lambda x: x[1], reverse=True):
-        print(f"  * {pref.title()} (importance: {value}/5)")
-    
-    # Targeted strategy recommendations
-    if accepted_week and accepted_week < 4:
-        print("\n- Your simulation accepted an offer very early. Consider:")
-        print("  * Being more selective in the first month (higher initial threshold)")
-        print("  * Conducting more research on market rates for your skills")
-        print("  * Improving application materials to generate more/better offers")
-    elif accepted_week and accepted_week > optimizer.financial_runway:
-        print("\n- Your simulation accepted an offer after financial runway was depleted. Consider:")
-        print("  * Building a larger emergency fund")
-        print("  * Being less selective as runway approaches its end")
-        print("  * Exploring part-time or contract work during the search")
-    
-    print("\nJob Search Strategy Complete!")
+    # Run the advanced simulation
+    run_advanced_simulation(preferences)
 
 if __name__ == "__main__":
     main()
