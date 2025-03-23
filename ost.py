@@ -1,1828 +1,2006 @@
-import numpy as np
-import scipy.stats as stats
-import matplotlib.pyplot as plt
-from scipy.integrate import quad
-from scipy.optimize import minimize
-from dataclasses import dataclass
-import json
 import random
-from typing import List, Dict, Tuple, Optional, Callable, Any
-import pandas as pd
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+import numpy as np
+import datetime
+import math
+from typing import Dict, List, Any, Tuple, Optional, Callable
+from scipy.stats import beta, norm
 
-# Parse user data from the provided JSON format (keeping the original function)
-def parse_user_data(data_string: str) -> dict:
-    """Extract user preferences from the provided JSON data."""
-    try:
-        # First attempt - treat as complete JSON with just missing outer braces
-        json_str = "{" + data_string + "}"
-        user_data = json.loads(json_str)
-        
-        # Convert the list of question/response pairs into a dictionary for easier access
-        preferences = {}
-        for item in user_data['user_data']:
-            preferences[item['question_type']] = item['response']
-        
-        return preferences
-    except json.JSONDecodeError:
-        try:
-            # Second attempt - the string might already be a complete JSON object
-            user_data = json.loads(data_string)
-            
-            # Convert the list of question/response pairs into a dictionary for easier access
-            preferences = {}
-            for item in user_data['user_data']:
-                preferences[item['question_type']] = item['response']
-            
-            return preferences
-        except json.JSONDecodeError:
-            try:
-                # Third attempt - try parsing as array directly
-                json_str = '{"user_data": [' + data_string.strip().strip('"user_data": [').strip(']},"') + ']}'
-                user_data = json.loads(json_str)
-                
-                # Convert the list of question/response pairs into a dictionary for easier access
-                preferences = {}
-                for item in user_data['user_data']:
-                    preferences[item['question_type']] = item['response']
-                
-                return preferences
-            except json.JSONDecodeError:
-                # Last resort - manually extract key-value pairs 
-                preferences = {}
-                # Extract each question_type and response pair using regex or string operations
-                import re
-                question_types = re.findall(r'"question_type": "([^"]+)"', data_string)
-                responses = re.findall(r'"response": ([^,\n]+)', data_string)
-                
-                # Match them up
-                for i in range(min(len(question_types), len(responses))):
-                    try:
-                        # Try to convert numerical values to float
-                        preferences[question_types[i]] = float(responses[i])
-                    except ValueError:
-                        # Keep as string if not a number
-                        preferences[question_types[i]] = responses[i]
-                
-                return preferences
+# ===========================================================================
+# 1. SEMANTIC VARIABLE FRAMEWORK
+# ===========================================================================
 
-@dataclass
-class JobOffer:
-    """Represents a job offer with various attributes."""
-    company: str
-    salary: float
-    career_growth: int  # 1-5 scale
-    location_score: int  # 1-5 scale
-    work_life_balance: int  # 1-5 scale
-    company_reputation: int  # 1-5 scale
-    role_responsibilities: int  # 1-5 scale
-    ai_component: int  # 1-5 scale
-    tech_stack_match: int  # 1-5 scale
-    mentoring_opportunity: int  # 1-5 scale
-    project_variety: int  # 1-5 scale
-    team_collaboration: int  # 1-5 scale
-    negotiation_flexibility: float = 0.0  # 0-1 scale, representing room for negotiation
+class VariableType:
+    """Defines the semantic meaning and processing rules for job variables."""
     
-    def calculate_utility(self, preferences: dict) -> float:
-        """Calculate the utility/value of this job offer based on user preferences."""
-        utility = 0.0
-        
-        # Salary component - normalized against minimum salary
-        min_salary = preferences.get('min_salary', 20000)
-        current_salary = preferences.get('current_salary', 25000)
-        salary_improvement = max(0, (self.salary - current_salary) / current_salary)
-        utility += salary_improvement * preferences.get('compensation_weight', 3)
-        
-        # Add weighted components for other job attributes
-        utility += self.career_growth * preferences.get('career_growth_weight', 3) / 5
-        utility += self.location_score * preferences.get('location_weight', 3) / 5
-        utility += self.work_life_balance * preferences.get('work_life_balance_weight', 3) / 5
-        utility += self.company_reputation * preferences.get('company_reputation_weight', 3) / 5
-        utility += self.role_responsibilities * preferences.get('role_responsibilities_weight', 3) / 5
-        utility += self.ai_component * preferences.get('ai_application_interest', 3) / 5
-        utility += self.tech_stack_match * preferences.get('tech_stack_alignment_weight', 3) / 5
-        utility += self.mentoring_opportunity * preferences.get('mentoring_opportunity_weight', 3) / 5
-        utility += self.project_variety * preferences.get('project_variety_weight', 3) / 5
-        utility += self.team_collaboration * preferences.get('team_collaboration_weight', 3) / 5
-        
-        # If salary is below minimum, heavily penalize
-        if self.salary < min_salary:
-            utility -= 10
-            
-        return utility
-    
-    def __str__(self) -> str:
-        return f"{self.company} - £{self.salary:,.2f}/year (Career:{self.career_growth}/5, WLB:{self.work_life_balance}/5)"
-
-
-class BayesianJobMarketModel:
-    """
-    A Bayesian model of the job market that updates beliefs based on observed offers.
-    This represents a significant advancement over the original model by learning from
-    the data as it's observed.
-    """
-    
-    def __init__(self, preferences: dict):
+    def __init__(self, 
+                 name: str,
+                 var_type: str,
+                 higher_is_better: bool,
+                 context_dependent: bool,
+                 can_be_hard_constraint: bool,
+                 normalization_method: str,
+                 description: str):
         """
-        Initialize the Bayesian job market model with prior beliefs.
+        Initialize a variable type definition.
         
         Args:
-            preferences: User preferences for job attributes
+            name: Variable identifier
+            var_type: Category of variable (monetary, quality, time, etc.)
+            higher_is_better: Whether higher values are preferred
+            context_dependent: Whether interpretation depends on field/experience
+            can_be_hard_constraint: Whether this can be a deal-breaker
+            normalization_method: How to normalize this variable
+            description: Human-readable explanation of the variable
         """
-        self.preferences = preferences
+        self.name = name
+        self.var_type = var_type
+        self.higher_is_better = higher_is_better
+        self.context_dependent = context_dependent
+        self.can_be_hard_constraint = can_be_hard_constraint
+        self.normalization_method = normalization_method
+        self.description = description
         
-        # Prior beliefs about job market - represented as distribution parameters
-        # We'll use Gaussian distributions for continuous variables and Beta for bounded ones
-        self.current_salary = preferences.get('current_salary', 25000)
-        
-        # Salary model - represented as a Gaussian mixture
-        # Components: below market, at market, above market, significantly above market
-        self.salary_weights = np.array([0.3, 0.4, 0.2, 0.1])  # Initial mixture weights
-        self.salary_means = np.array([
-            0.9 * self.current_salary,  # Below market
-            1.08 * self.current_salary,  # At market
-            1.2 * self.current_salary,  # Above market
-            1.4 * self.current_salary,  # Significantly above market
-        ])
-        self.salary_stds = np.array([
-            0.1 * self.current_salary,
-            0.05 * self.current_salary,
-            0.08 * self.current_salary,
-            0.15 * self.current_salary,
-        ])
-        
-        # Prior for job attributes (alpha, beta parameters for Beta distributions)
-        # Higher alpha relative to beta means we expect higher values
-        self.attribute_priors = {
-            'career_growth': (2, 2),          # Uniform prior initially
-            'location_score': (2, 2),
-            'work_life_balance': (2, 2),
-            'company_reputation': (2, 2),
-            'role_responsibilities': (2, 2),
-            'ai_component': (2, 2),
-            'tech_stack_match': (2, 2),
-            'mentoring_opportunity': (2, 2),
-            'project_variety': (2, 2),
-            'team_collaboration': (2, 2),
-        }
-        
-        # Keep observed data for updating our model
-        self.observed_salaries = []
-        self.observed_attributes = {attr: [] for attr in self.attribute_priors}
-        
-        # Market condition modeling 
-        self.market_condition = 1.0  # 1.0 means neutral market
-        self.market_volatility = 0.05  # How much market conditions change over time
-        self.seasonality_factors = [
-            1.05, 1.08, 1.10, 1.05,  # Q1: Hiring season in many industries
-            0.98, 0.95, 0.92, 0.90,  # Q2: Slowing down, budgets allocated
-            0.88, 0.90, 0.93, 0.95,  # Q3: Summer slowdown, then picking up
-            1.02, 1.08, 1.12, 1.10,  # Q4: Year-end hiring push, then holiday slowdown
-        ]
-        
-        # Strategic employer behavior model
-        self.negotiation_model = {
-            'initial_lowball_factor': 0.9,  # Initial offers are typically 90% of max
-            'candidate_desirability': 1.0,  # How desirable the candidate is (1.0 = neutral)
-            'urgency_to_fill': 0.5,         # How urgent is the position to be filled (0-1)
-            'counter_offer_improvement': 0.05,  # 5% improvement on counter offers
-        }
-        
-        # Time-variant skill improvement model
-        self.skill_growth_rate = 0.01  # 1% skill growth per unit time
-        self.last_update_time = 0
-        
-        # Learning model for interview success
-        self.interview_gp = self._initialize_gp_model()
-        self.interview_outcomes = []  # [(features, outcome), ...]
-        
-    def _initialize_gp_model(self):
-        """Initialize a Gaussian Process model for learning interview success factors."""
-        # RBF kernel with noise
-        kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
-        return GaussianProcessRegressor(kernel=kernel, alpha=1e-10)
+    def __repr__(self):
+        return f"VariableType({self.name}, {self.var_type}, {'↑' if self.higher_is_better else '↓'})"
+
+
+# Define standard variable types
+VARIABLE_TYPES = {
+    # Monetary variables
+    "base_salary": VariableType(
+        name="base_salary",
+        var_type="monetary",
+        higher_is_better=True,
+        context_dependent=True,  # Depends on field, experience, location
+        can_be_hard_constraint=True,
+        normalization_method="field_relative",
+        description="Annual base salary before bonuses or benefits"
+    ),
+    "total_compensation": VariableType(
+        name="total_compensation",
+        var_type="monetary",
+        higher_is_better=True,
+        context_dependent=True,
+        can_be_hard_constraint=True,
+        normalization_method="field_relative",
+        description="Total annual compensation including salary, bonuses, and benefits"
+    ),
     
-    def update_with_offer(self, offer: JobOffer, time_point: float, was_successful: bool = None):
+    # Quality variables
+    "work_life_balance": VariableType(
+        name="work_life_balance",
+        var_type="quality",
+        higher_is_better=True,
+        context_dependent=False,  # Universal preference
+        can_be_hard_constraint=True,
+        normalization_method="absolute_scale",
+        description="Balance between work demands and personal time (1-10)"
+    ),
+    "career_growth": VariableType(
+        name="career_growth",
+        var_type="quality",
+        higher_is_better=True,
+        context_dependent=True,  # Different at different career stages
+        can_be_hard_constraint=True,
+        normalization_method="absolute_scale",
+        description="Opportunities for advancement and skill development (1-10)"
+    ),
+    "company_reputation": VariableType(
+        name="company_reputation",
+        var_type="quality",
+        higher_is_better=True,
+        context_dependent=True,  # Industry-specific
+        can_be_hard_constraint=False,
+        normalization_method="absolute_scale",
+        description="Overall reputation of the company (1-10)"
+    ),
+    "team_collaboration": VariableType(
+        name="team_collaboration",
+        var_type="quality",
+        higher_is_better=True,
+        context_dependent=False,
+        can_be_hard_constraint=True,
+        normalization_method="absolute_scale",
+        description="Quality of team collaboration and communication (1-10)"
+    ),
+    
+    # Location/logistics variables
+    "commute_time": VariableType(
+        name="commute_time",
+        var_type="time",
+        higher_is_better=False,  # Lower is better
+        context_dependent=True,  # Location-dependent
+        can_be_hard_constraint=True,
+        normalization_method="inverse_scale",
+        description="Daily commute time in minutes (one-way)"
+    ),
+    "remote_work": VariableType(
+        name="remote_work",
+        var_type="boolean",
+        higher_is_better=True,
+        context_dependent=True,  # Different fields value differently
+        can_be_hard_constraint=True,
+        normalization_method="binary",
+        description="Whether remote work is available (0=No, 10=Full remote)"
+    ),
+    
+    # Role-specific variables
+    "tech_stack_alignment": VariableType(
+        name="tech_stack_alignment",
+        var_type="alignment",
+        higher_is_better=True,
+        context_dependent=True,  # Field-specific
+        can_be_hard_constraint=True,
+        normalization_method="absolute_scale",
+        description="Alignment with preferred technologies and tools (1-10)"
+    ),
+    "role_responsibilities": VariableType(
+        name="role_responsibilities",
+        var_type="alignment",
+        higher_is_better=True,
+        context_dependent=True,
+        can_be_hard_constraint=True,
+        normalization_method="absolute_scale",
+        description="Alignment with preferred job responsibilities (1-10)"
+    )
+}
+
+# ===========================================================================
+# 2. CONTEXT SYSTEM
+# ===========================================================================
+
+class ContextSystem:
+    """
+    System for understanding how variables should be interpreted in different
+    contexts (fields, experience levels, locations, etc.)
+    """
+    
+    def __init__(self):
+        """Initialize with context definitions."""
+        # Field-specific context information
+        self.field_contexts = {
+            "software_engineering": {
+                "base_salary": {"median": 120000, "std_dev": 30000},
+                "remote_work": {"importance_factor": 1.5},
+                "tech_stack_alignment": {"applicable": True, "importance_factor": 1.3},
+                "variables": {
+                    "tech_stack_alignment": True,
+                    "team_collaboration": 1.2, 
+                }
+            },
+            "data_science": {
+                "base_salary": {"median": 110000, "std_dev": 25000},
+                "remote_work": {"importance_factor": 1.3},
+                "tech_stack_alignment": {"applicable": True, "importance_factor": 1.4},
+            },
+            "marketing": {
+                "base_salary": {"median": 75000, "std_dev": 20000},
+                "remote_work": {"importance_factor": 0.9},
+                "tech_stack_alignment": {"applicable": False},
+            },
+            "finance": {
+                "base_salary": {"median": 100000, "std_dev": 35000},
+                "remote_work": {"importance_factor": 0.7},
+                "tech_stack_alignment": {"applicable": False},
+            },
+            "general": {  # Default fallback
+                "base_salary": {"median": 80000, "std_dev": 25000},
+                "remote_work": {"importance_factor": 1.0},
+                "tech_stack_alignment": {"applicable": False},
+            }
+        }
+        
+        # Experience level modifiers
+        self.experience_contexts = {
+            "entry": {
+                "salary_modifier": 0.7,
+                "career_growth_importance": 1.6,
+                "company_reputation_importance": 1.3,
+            },
+            "mid": {
+                "salary_modifier": 1.0,
+                "career_growth_importance": 1.2,
+                "company_reputation_importance": 1.0,
+            },
+            "senior": {
+                "salary_modifier": 1.4,
+                "career_growth_importance": 0.9,
+                "company_reputation_importance": 0.8,
+            },
+            "executive": {
+                "salary_modifier": 2.0,
+                "career_growth_importance": 0.7,
+                "company_reputation_importance": 1.5,
+            }
+        }
+        
+        # Location-based cost of living adjustments
+        self.location_contexts = {
+            "san_francisco": {"cost_modifier": 1.5},
+            "new_york": {"cost_modifier": 1.4},
+            "seattle": {"cost_modifier": 1.3},
+            "austin": {"cost_modifier": 1.1},
+            "remote": {"cost_modifier": 1.0},
+            "other": {"cost_modifier": 1.0}
+        }
+        
+        # Define the variable interaction matrix - which variables affect others
+        # This is a more general and flexible approach than hardcoded relationship functions
+        self.variable_interactions = {
+            # Format: "influencing_var": {"affected_var": weight_modifier}
+            "work_life_balance": {"base_salary": 0.15, "total_compensation": 0.12},
+            "remote_work": {"base_salary": 0.12, "commute_time": 0.8},
+            "career_growth": {"base_salary": 0.1},
+            "company_reputation": {"base_salary": 0.08, "career_growth": 0.2},
+            "team_collaboration": {"work_life_balance": 0.15},
+            "tech_stack_alignment": {"career_growth": 0.2}
+        }
+        
+        # Define common "would accept lower X for better Y" preferences
+        self.common_tradeoffs = {
+            "software_engineering": [
+                ("remote_work", "base_salary", 0.15),  # Would accept 15% less salary for remote work
+                ("work_life_balance", "base_salary", 0.2),  # Would accept 20% less salary for better WLB
+                ("tech_stack_alignment", "base_salary", 0.1)  # Would accept 10% less for better tech
+            ],
+            "marketing": [
+                ("company_reputation", "base_salary", 0.18),  # Reputation matters more in marketing
+                ("career_growth", "base_salary", 0.15)
+            ],
+            "general": [
+                ("work_life_balance", "base_salary", 0.15),
+                ("career_growth", "base_salary", 0.1)
+            ]
+        }
+    
+    def get_context(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Update our model with a new observed job offer.
+        Create a complete context object based on user profile.
         
         Args:
-            offer: The observed job offer
-            time_point: The time point when this offer was observed (0-1 scale)
-            was_successful: Whether this job application was successful (None if not yet known)
+            user_profile: User's profile containing field, experience, location etc.
+            
+        Returns:
+            Dictionary with all relevant context information
         """
-        # Track the salary
-        self.observed_salaries.append(offer.salary)
+        context = {}
         
-        # Track the attributes
-        for attr in self.attribute_priors:
-            if hasattr(offer, attr):
-                # Convert 1-5 scale to 0-1 scale for Beta distribution
-                value = getattr(offer, attr) / 5.0
-                self.observed_attributes[attr].append(value)
+        # Get field context (default to general if not found)
+        field = user_profile.get("field", "general")
+        if field not in self.field_contexts:
+            field = "general"
+        context["field"] = self.field_contexts[field]
         
-        # Update our Bayesian model
-        self._update_salary_model()
-        self._update_attribute_models()
+        # Get experience context
+        experience = user_profile.get("experience_level", "mid")
+        if experience not in self.experience_contexts:
+            experience = "mid"
+        context["experience"] = self.experience_contexts[experience]
         
-        # Update market condition model
-        self._update_market_condition(time_point)
+        # Get location context
+        location = user_profile.get("location", "other")
+        if location not in self.location_contexts:
+            location = "other"
+        context["location"] = self.location_contexts[location]
         
-        # Update skill growth model
-        self._update_skills(time_point)
+        # Combined parameters for convenience
+        context["expected_salary"] = context["field"]["base_salary"]["median"] * \
+                                   context["experience"]["salary_modifier"] * \
+                                   context["location"]["cost_modifier"]
         
-        # Update interview success model if outcome is known
-        if was_successful is not None:
-            self._update_interview_model(offer, was_successful)
+        # Add field-specific tradeoffs
+        context["tradeoffs"] = self.common_tradeoffs.get(field, self.common_tradeoffs["general"])
+        
+        return context
     
-    def _update_salary_model(self):
-        """Update the salary model based on observed salaries."""
-        if len(self.observed_salaries) < 2:
-            return  # Not enough data to update
+    def apply_variable_relationships(self, offer: Dict[str, Any], context: Dict[str, Any], 
+                                   preferences: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply dynamic variable relationship models to modify perceptions.
         
-        # Fit a Gaussian Mixture Model to the observed salaries
-        from sklearn.mixture import GaussianMixture
+        Args:
+            offer: The job offer data
+            context: The context information
+            preferences: User preferences
+            
+        Returns:
+            Modified offer with adjusted perceptions
+        """
+        adjusted_offer = offer.copy()
         
-        # Reshape for scikit-learn
-        data = np.array(self.observed_salaries).reshape(-1, 1)
-        
-        # Determine number of components based on available data
-        # We need at least as many samples as components
-        n_samples = len(self.observed_salaries)
-        n_components = min(4, n_samples)  # Use at most 4 components, but no more than we have samples
-        
-        # Fit GMM with appropriate number of components
-        gmm = GaussianMixture(n_components=n_components, random_state=42)
-        gmm.fit(data)
-        
-        # Extract the updated parameters
-        self.salary_weights = gmm.weights_
-        self.salary_means = gmm.means_.flatten()
-        self.salary_stds = np.sqrt(gmm.covariances_.flatten())
-        
-        # Sort the components by mean for consistency
-        idx = np.argsort(self.salary_means)
-        self.salary_means = self.salary_means[idx]
-        self.salary_stds = self.salary_stds[idx]
-        self.salary_weights = self.salary_weights[idx]
-        
-        # If we have fewer than 4 components, pad the arrays to maintain consistent shape
-        if n_components < 4:
-            # Pad with zeros, maintaining the same structure
-            if n_components == 1:
-                # Special case for 1 component
-                self.salary_weights = np.array([0.1, 0.1, 0.1, 0.7])  # Most weight on the single observed component
-                self.salary_means = np.array([
-                    0.85 * self.salary_means[0],
-                    0.95 * self.salary_means[0],
-                    1.05 * self.salary_means[0],
-                    self.salary_means[0]
-                ])
-                self.salary_stds = np.array([
-                    self.salary_stds[0],
-                    self.salary_stds[0],
-                    self.salary_stds[0],
-                    self.salary_stds[0]
-                ])
-            else:
-                # For 2 or 3 components, extend proportionally
-                current_means = self.salary_means.copy()
-                current_stds = self.salary_stds.copy()
-                current_weights = self.salary_weights.copy()
-                
-                # Initialize full-sized arrays
-                self.salary_means = np.zeros(4)
-                self.salary_stds = np.zeros(4)
-                self.salary_weights = np.zeros(4)
-                
-                # Copy existing components
-                self.salary_means[:n_components] = current_means
-                self.salary_stds[:n_components] = current_stds
-                self.salary_weights[:n_components] = current_weights * 0.7  # Scale down to make room for synthetic components
-                
-                # Create synthetic components at the edges
-                min_mean = np.min(current_means)
-                max_mean = np.max(current_means)
-                range_mean = max_mean - min_mean
-                
-                # Fill remaining components
-                for i in range(n_components, 4):
-                    if i == n_components:
-                        # Add a component below the minimum
-                        self.salary_means[i] = min_mean - (range_mean * 0.1)
-                        self.salary_stds[i] = np.mean(current_stds)
-                        self.salary_weights[i] = 0.3 / (4 - n_components)
-                    elif i == n_components + 1 and n_components < 3:
-                        # Add a component above the maximum
-                        self.salary_means[i] = max_mean + (range_mean * 0.1)
-                        self.salary_stds[i] = np.mean(current_stds)
-                        self.salary_weights[i] = 0.3 / (4 - n_components)
-                    else:
-                        # Add a component in between
-                        self.salary_means[i] = min_mean + (range_mean * 0.5)
-                        self.salary_stds[i] = np.mean(current_stds)
-                        self.salary_weights[i] = 0.3 / (4 - n_components)
-    
-    def _update_attribute_models(self):
-        """Update the attribute models based on observed attributes."""
-        for attr, values in self.observed_attributes.items():
-            if not values:
+        # Process all potential variable interactions dynamically
+        for influencing_var, affected_vars in self.variable_interactions.items():
+            # Skip if influencing variable is not in the offer
+            if influencing_var not in offer:
                 continue
                 
-            # Get prior parameters
-            alpha_prior, beta_prior = self.attribute_priors[attr]
+            influence_value = offer[influencing_var]
             
-            # Convert 1-5 values to successes/failures for Beta
-            n_values = len(values)
-            successes = sum(values)  # Sum of normalized 0-1 values
+            # Skip non-numeric values
+            if not isinstance(influence_value, (int, float)):
+                continue
+                
+            # Check if this variable is above average (normalized to 1-10 scale)
+            # For boolean variables like remote_work, any value > 5 is considered positive
+            is_positive_influence = influence_value > 5
             
-            # Update the Beta parameters
-            alpha_posterior = alpha_prior + successes
-            beta_posterior = beta_prior + (n_values - successes)
+            # Get user's weight for this variable if available
+            var_weight = preferences.get(f"{influencing_var}_weight", 3) / 5  # Normalize to 0-1 scale
             
-            # Save the updated parameters
-            self.attribute_priors[attr] = (alpha_posterior, beta_posterior)
+            # Apply influence to each affected variable
+            for affected_var, base_modifier in affected_vars.items():
+                # Skip if affected variable not in offer
+                if affected_var not in offer:
+                    continue
+                    
+                # Skip non-numeric values
+                if not isinstance(offer[affected_var], (int, float)):
+                    continue
+                
+                # Calculate influence magnitude based on:
+                # 1. How much above/below average the influencing variable is
+                # 2. The user's personal weight for the influencing variable
+                # 3. The base modifier for this relationship
+                deviation_from_avg = (influence_value - 5) / 5  # -1 to +1 scale
+                influence_magnitude = deviation_from_avg * var_weight * base_modifier
+                
+                # Apply the influence (only positive influences for now)
+                if is_positive_influence:
+                    # For monetary variables (positive adjustment)
+                    if affected_var in ["base_salary", "total_compensation"]:
+                        adjustment_factor = 1 + influence_magnitude
+                        adjusted_value = offer[affected_var] * adjustment_factor
+                    # For quality variables on 1-10 scale (cap at 10)
+                    else:
+                        adjustment_amount = influence_magnitude * 10  # Scale to 1-10
+                        adjusted_value = min(10, offer[affected_var] + adjustment_amount)
+                    
+                    # Store the adjusted value
+                    adjusted_key = f"adjusted_{affected_var}"
+                    adjusted_offer[adjusted_key] = adjusted_value
+        
+        # Apply field-specific tradeoffs from user's "would accept lower X for better Y"
+        if "would_accept_lower_salary_for" in preferences:
+            for tradeoff_var in preferences["would_accept_lower_salary_for"]:
+                if tradeoff_var in offer and offer.get(tradeoff_var, 0) > 7:  # Good value in tradeoff var
+                    # Find base modifier from context tradeoffs
+                    for (var1, var2, modifier) in context.get("tradeoffs", []):
+                        if var1 == tradeoff_var and var2 == "base_salary":
+                            # Apply personal tradeoff adjustment to salary perception
+                            if "adjusted_base_salary" not in adjusted_offer:
+                                salary_perception = offer["base_salary"] * (1 + modifier)
+                                adjusted_offer["adjusted_base_salary"] = salary_perception
+                            break
+        
+        return adjusted_offer
+
+# ===========================================================================
+# 3. ENHANCED PREFERENCE PROCESSOR
+# ===========================================================================
+
+class EnhancedPreferenceProcessor:
+    """
+    Enhanced processor for user preferences with semantic understanding
+    and non-linear utility functions.
+    """
     
-    def _update_market_condition(self, time_point: float):
+    def __init__(self, user_profile: Dict[str, Any], user_preferences: Dict[str, Any]):
         """
-        Update the market condition based on time and seasonality.
+        Initialize preference processor with user profile and preferences.
         
         Args:
-            time_point: Time on 0-1 scale (0 = start of search, 1 = max time)
+            user_profile: User information (field, experience, location, etc.)
+            user_preferences: User's stated preferences and weights
         """
-        # Get the seasonal factor for this time
+        self.user_profile = user_profile
+        self.user_preferences = user_preferences
+        
+        # Set up context system
+        self.context_system = ContextSystem()
+        self.context = self.context_system.get_context(user_profile)
+        
+        # Extract hard constraints
+        self.hard_constraints = self._extract_hard_constraints()
+        
+        # Extract variable weights (with defaults)
+        self.variable_weights = self._extract_weights()
+        
+        # Set up normalization functions
+        self.normalization_functions = {
+            "field_relative": self._normalize_field_relative,
+            "absolute_scale": self._normalize_absolute_scale,
+            "inverse_scale": self._normalize_inverse_scale,
+            "binary": self._normalize_binary
+        }
+    
+    def _extract_hard_constraints(self) -> Dict[str, Any]:
+        """Extract hard constraints from preferences."""
+        constraints = {}
+        
+        # Minimum salary is a common hard constraint
+        if "min_salary" in self.user_preferences:
+            constraints["base_salary"] = self.user_preferences["min_salary"]
+        
+        # Extract other hard constraints marked with "min_" or "must_"
+        for key, value in self.user_preferences.items():
+            if key.startswith("min_") and key != "min_salary":
+                var_name = key[4:]  # Remove "min_" prefix
+                if var_name in VARIABLE_TYPES and VARIABLE_TYPES[var_name].can_be_hard_constraint:
+                    constraints[var_name] = value
+                    
+            elif key.startswith("must_"):
+                var_name = key[5:]  # Remove "must_" prefix
+                if var_name in VARIABLE_TYPES and VARIABLE_TYPES[var_name].can_be_hard_constraint:
+                    constraints[var_name] = True
+        
+        # Include deal-breakers
+        if "deal_breakers" in self.user_profile:
+            for item in self.user_profile["deal_breakers"]:
+                constraints[item] = True
+        
+        return constraints
+    
+    def _extract_weights(self) -> Dict[str, float]:
+        """Extract and normalize preference weights."""
+        weights = {}
+        
+        # Extract explicit weights
+        for key, value in self.user_preferences.items():
+            if key.endswith("_weight"):
+                var_name = key.replace("_weight", "")
+                weights[var_name] = float(value)
+        
+        # Adjust weights based on context
+        for var_name, weight in list(weights.items()):
+            # Adjust based on experience level
+            if var_name == "career_growth":
+                weights[var_name] *= self.context["experience"]["career_growth_importance"]
+            
+            # Adjust based on field
+            if var_name in self.context["field"].get("variables", {}):
+                field_factor = self.context["field"]["variables"][var_name]
+                if isinstance(field_factor, (int, float)):
+                    weights[var_name] *= field_factor
+        
+        return weights
+    
+    def check_hard_constraints(self, offer: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Check if an offer meets all hard constraints.
+        
+        Args:
+            offer: The job offer data
+            
+        Returns:
+            Tuple of (meets_constraints, reason)
+        """
+        for var_name, constraint_value in self.hard_constraints.items():
+            if var_name not in offer:
+                continue
+                
+            var_type = VARIABLE_TYPES.get(var_name)
+            if not var_type:
+                continue
+                
+            offer_value = offer[var_name]
+                
+            # For numeric constraints
+            if isinstance(constraint_value, (int, float)) and isinstance(offer_value, (int, float)):
+                if var_type.higher_is_better and offer_value < constraint_value:
+                    return False, f"{var_name} ({offer_value}) below minimum requirement ({constraint_value})"
+                elif not var_type.higher_is_better and offer_value > constraint_value:
+                    return False, f"{var_name} ({offer_value}) above maximum acceptable ({constraint_value})"
+            
+            # For boolean constraints
+            elif isinstance(constraint_value, bool) and constraint_value:
+                if not offer_value:
+                    return False, f"Required {var_name} not available"
+        
+        return True, "Meets all hard constraints"
+    
+    def _normalize_field_relative(self, var_name: str, value: float) -> float:
+        """
+        Normalize a value relative to field expectations.
+        
+        Args:
+            var_name: Variable name
+            value: Raw value
+            
+        Returns:
+            Normalized value (0-1 scale)
+        """
+        if var_name == "base_salary" or var_name == "total_compensation":
+            # Get expected salary from context
+            expected_salary = self.context["expected_salary"]
+            std_dev = self.context["field"]["base_salary"]["std_dev"] * \
+                     self.context["experience"]["salary_modifier"]
+            
+            # Calculate z-score (how many standard deviations from the mean)
+            z_score = (value - expected_salary) / std_dev
+            
+            # Convert to 0-1 scale using sigmoid function
+            normalized = 1 / (1 + math.exp(-z_score))
+            
+            # Scale to ensure a reasonable range (0.2 for -2 std dev, 0.8 for +2 std dev)
+            normalized = max(0.01, min(0.99, normalized))
+            
+            return normalized
+        
+        # Fallback for other field-relative variables
+        return value / 10.0
+    
+    def _normalize_absolute_scale(self, var_name: str, value: float) -> float:
+        """Normalize a value on an absolute 1-10 scale to 0-1."""
+        # Simple linear normalization for 1-10 scale
+        normalized = (value - 1) / 9.0
+        return max(0, min(1, normalized))
+    
+    def _normalize_inverse_scale(self, var_name: str, value: float) -> float:
+        """
+        Normalize variables where lower is better (like commute time).
+        
+        Args:
+            var_name: Variable name
+            value: Raw value
+            
+        Returns:
+            Normalized value (0-1 scale, higher is better)
+        """
+        if var_name == "commute_time":
+            # Commute time: 0 min = 1.0, 60+ min = 0.0
+            max_acceptable = 60.0
+            normalized = max(0, 1.0 - (value / max_acceptable))
+            return normalized
+            
+        # Generic inverse for other variables
+        return 1.0 - (value / 10.0)
+    
+    def _normalize_binary(self, var_name: str, value: float) -> float:
+        """Normalize binary variables."""
+        # For boolean values converted to 0-10 scale
+        return value / 10.0
+    
+    def normalize_variable(self, var_name: str, value: float) -> float:
+        """
+        Normalize a variable to 0-1 scale using appropriate method.
+        
+        Args:
+            var_name: Variable name
+            value: Raw value
+            
+        Returns:
+            Normalized value (0-1 scale)
+        """
+        # Get variable type
+        var_type = VARIABLE_TYPES.get(var_name)
+        if not var_type:
+            # Default normalization for unknown variables
+            return value / 10.0
+            
+        # Get normalization method for this variable
+        method = var_type.normalization_method
+        normalize_fn = self.normalization_functions.get(method, self._normalize_absolute_scale)
+        
+        # Apply normalization function
+        return normalize_fn(var_name, value)
+    
+    def apply_non_linear_utility(self, var_name: str, normalized_value: float) -> float:
+        """
+        Apply non-linear utility function to a normalized value.
+        
+        Args:
+            var_name: Variable name
+            normalized_value: Normalized value (0-1 scale)
+            
+        Returns:
+            Utility value with non-linear adjustments
+        """
+        # Get the weight for this variable
+        weight = self.variable_weights.get(var_name, 1.0)
+        
+        # Apply different utility curves based on variable type and weight
+        if weight > 3.5:  # High importance
+            # Convex curve for high-importance variables (steep improvement at higher values)
+            # This means small differences at the high end matter a lot
+            return normalized_value ** 0.7 * weight
+        elif weight < 2.5:  # Low importance
+            # Concave curve for low-importance variables (diminishing returns)
+            return normalized_value ** 1.3 * weight
+        else:  # Medium importance
+            # Linear utility for medium importance
+            return normalized_value * weight
+    
+    def calculate_offer_utility(self, offer: Dict[str, Any]) -> float:
+        """
+        Calculate normalized weighted utility of an offer with semantic understanding.
+        
+        Args:
+            offer: The job offer data
+            
+        Returns:
+            Utility value (0-10 scale)
+        """
+        # First apply variable relationships to get adjusted perceptions
+        adjusted_offer = self.context_system.apply_variable_relationships(
+            offer, self.context, self.user_preferences
+        )
+        
+        # Check hard constraints first
+        meets_constraints, _ = self.check_hard_constraints(adjusted_offer)
+        if not meets_constraints:
+            return -10.0  # Strong penalty for violating hard constraints
+        
+        # Calculate utility components
+        utility = 0.0
+        total_weight = 0.0
+        
+        # Process each attribute with semantic understanding
+        for var_name, var_type in VARIABLE_TYPES.items():
+            # Skip if not in offer
+            if var_name not in adjusted_offer:
+                continue
+                
+            # Check for adjusted value first (from relationship model)
+            if f"adjusted_{var_name}" in adjusted_offer:
+                value = adjusted_offer[f"adjusted_{var_name}"]
+            else:
+                value = adjusted_offer[var_name]
+                
+            # Skip non-numeric values
+            if not isinstance(value, (int, float)):
+                continue
+                
+            # Get weight for this variable
+            weight = self.variable_weights.get(var_name, 1.0)
+            
+            # Normalize value
+            normalized_value = self.normalize_variable(var_name, value)
+            
+            # Apply non-linear utility function
+            component_utility = self.apply_non_linear_utility(var_name, normalized_value)
+            
+            # Add to total utility
+            utility += component_utility
+            total_weight += weight
+        
+        # Scale to 0-10 range if we have weights
+        if total_weight > 0:
+            scaled_utility = (utility / total_weight) * 10
+        else:
+            scaled_utility = utility
+            
+        return scaled_utility
+
+# ===========================================================================
+# 4. ENHANCED BAYESIAN BELIEF MODEL
+# ===========================================================================
+
+class EnhancedBayesianModel:
+    """
+    Enhanced Bayesian framework for modeling job market with semantic understanding
+    and field-specific priors.
+    """
+    
+    def __init__(self, user_profile: Dict[str, Any], user_preferences: Dict[str, Any]):
+        """Initialize Bayesian belief model with semantic understanding."""
+        self.user_profile = user_profile
+        self.user_preferences = user_preferences
+        
+        # Set up context system
+        self.context_system = ContextSystem()
+        self.context = self.context_system.get_context(user_profile)
+        
+        # Initialize field-specific salary model
+        expected_salary = self.context["expected_salary"]
+        salary_std = self.context["field"]["base_salary"]["std_dev"] * \
+                   self.context["experience"]["salary_modifier"]
+        
+        # Salary model: Normal distribution with conjugate Normal-Inverse-Gamma prior
+        self.salary_model = {
+            'mu': expected_salary,
+            'kappa': 2.0,  # Prior strength
+            'alpha': 3.0,  # Shape parameter
+            'beta': 0.5 * salary_std,  # Scale parameter
+            'observations': []
+        }
+        
+        # Initialize attribute models
+        self.attribute_models = {}
+        
+        # Set up priors for each attribute based on semantic understanding
+        for var_name, var_type in VARIABLE_TYPES.items():
+            if var_name != "base_salary" and var_name != "total_compensation":
+                # Set field-specific priors when applicable
+                if var_type.context_dependent and var_name in self.context["field"].get("variables", {}):
+                    field_info = self.context["field"]["variables"][var_name]
+                    # For boolean values
+                    if isinstance(field_info, bool):
+                        if field_info:
+                            self.attribute_models[var_name] = {
+                                'alpha': 4.0,  # More confident prior
+                                'beta': 2.0,   # Skewed toward positive
+                                'observations': []
+                            }
+                        else:
+                            self.attribute_models[var_name] = {
+                                'alpha': 2.0,
+                                'beta': 4.0,   # Skewed toward negative
+                                'observations': []
+                            }
+                    # For numeric modifiers
+                    elif isinstance(field_info, (int, float)):
+                        if field_info > 1.0:  # More important in this field
+                            self.attribute_models[var_name] = {
+                                'alpha': 3.0 * field_info,
+                                'beta': 3.0,
+                                'observations': []
+                            }
+                        else:
+                            self.attribute_models[var_name] = {
+                                'alpha': 3.0,
+                                'beta': 3.0 / field_info if field_info > 0 else 6.0,
+                                'observations': []
+                            }
+                else:
+                    # Default uninformative prior
+                    self.attribute_models[var_name] = {
+                        'alpha': 3.0,
+                        'beta': 3.0,
+                        'observations': []
+                    }
+        
+        # Market condition model with field-specific prior
+        # MODIFICATION 1: Strengthen market condition
+        self.market_model = {
+            'alpha': 8.0,  # Changed from 5.0 to 8.0
+            'beta': 3.0,   # Changed from 5.0 to 3.0
+            'observations': []
+        }
+        
+        # Track offers and rejections
+        self.num_offers = 0
+        self.num_rejections = 0
+        
+        # Seasonality model
+        self.seasonality_factors = [
+            1.05, 1.08, 1.10, 1.05,  # Q1
+            0.98, 0.95, 0.92, 0.90,  # Q2
+            0.88, 0.90, 0.93, 0.95,  # Q3
+            1.02, 1.08, 1.12, 1.10,  # Q4
+        ]
+    
+    def update_with_offer(self, offer: Dict[str, Any], was_accepted: bool = None):
+        """
+        Update Bayesian model with a new observed job offer.
+        
+        Args:
+            offer: The job offer data
+            was_accepted: Whether this offer was accepted by the user
+        """
+        # Update salary model
+        if 'base_salary' in offer:
+            # Normalize salary based on context before updating
+            normalized_salary = offer['base_salary'] / self.context["location"]["cost_modifier"]
+            self._update_salary_model(normalized_salary)
+        
+        # Update attribute models
+        for attr_name, model in self.attribute_models.items():
+            if attr_name in offer:
+                # Get variable type
+                var_type = VARIABLE_TYPES.get(attr_name)
+                if not var_type:
+                    continue
+                    
+                # Get value and normalize to 0-1 scale for Beta model
+                value = offer[attr_name]
+                if not isinstance(value, (int, float)):
+                    continue
+                    
+                # Normalize based on variable type
+                if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                    normalized_value = (value - 1) / 9.0  # 1-10 scale to 0-1
+                elif var_type.var_type == "boolean":
+                    normalized_value = value / 10.0  # 0-10 scale to 0-1
+                else:
+                    # Skip variables we don't know how to normalize
+                    continue
+                
+                # Update model
+                self._update_attribute_model(attr_name, normalized_value)
+        
+        # Update offer count
+        self.num_offers += 1
+        
+        # Learn from rejection if applicable
+        if was_accepted is False:
+            self.num_rejections += 1
+            self._learn_from_rejection(offer)
+    
+    def _update_salary_model(self, observed_salary: float):
+        """Update salary model with conjugate Normal-Inverse-Gamma update."""
+        # Store raw observation
+        self.salary_model['observations'].append(observed_salary)
+        
+        # Extract current parameters
+        mu0 = self.salary_model['mu']
+        kappa0 = self.salary_model['kappa']
+        alpha0 = self.salary_model['alpha']
+        beta0 = self.salary_model['beta']
+        
+        # Compute updated parameters (conjugate update)
+        kappa1 = kappa0 + 1
+        mu1 = (kappa0 * mu0 + observed_salary) / kappa1
+        alpha1 = alpha0 + 0.5
+        beta1 = beta0 + 0.5 * kappa0 / kappa1 * (observed_salary - mu0)**2
+        
+        # Store updated parameters
+        self.salary_model['mu'] = mu1
+        self.salary_model['kappa'] = kappa1
+        self.salary_model['alpha'] = alpha1
+        self.salary_model['beta'] = beta1
+    
+    def _update_attribute_model(self, attr_name: str, observed_value: float):
+        """Update attribute model with Beta conjugate update."""
+        # Skip if attribute doesn't exist in our model
+        if attr_name not in self.attribute_models:
+            return
+        
+        # Store raw observation
+        self.attribute_models[attr_name]['observations'].append(observed_value)
+        
+        # Extract current parameters
+        alpha0 = self.attribute_models[attr_name]['alpha']
+        beta0 = self.attribute_models[attr_name]['beta']
+        
+        # Beta conjugate update
+        # For continuous 0-1 values, we treat them as "success proportion"
+        alpha1 = alpha0 + observed_value
+        beta1 = beta0 + (1 - observed_value)
+        
+        # Store updated parameters
+        self.attribute_models[attr_name]['alpha'] = alpha1
+        self.attribute_models[attr_name]['beta'] = beta1
+    
+    def _learn_from_rejection(self, offer: Dict[str, Any]):
+        """Learn from rejected offers to improve future market model."""
+        # Identify key features of the rejected offer
+        salary_percentile = self._compute_salary_percentile(offer.get('base_salary', 0))
+        
+        # For each attribute, note if it was particularly low
+        low_attributes = []
+        for attr_name, model in self.attribute_models.items():
+            if attr_name in offer:
+                # Get variable type
+                var_type = VARIABLE_TYPES.get(attr_name)
+                if not var_type:
+                    continue
+                    
+                # Skip non-numeric values
+                if not isinstance(offer[attr_name], (int, float)):
+                    continue
+                    
+                # Normalize value
+                if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                    normalized_value = (offer[attr_name] - 1) / 9.0
+                elif var_type.var_type == "boolean":
+                    normalized_value = offer[attr_name] / 10.0
+                else:
+                    continue
+                
+                # Check if this attribute was below expected
+                posterior_mean = model['alpha'] / (model['alpha'] + model['beta'])
+                if normalized_value < posterior_mean - 0.2:  # Quite below average
+                    low_attributes.append(attr_name)
+        
+        # Update market model based on rejection
+        self._update_market_model_with_rejection(salary_percentile, low_attributes)
+    
+    def _compute_salary_percentile(self, salary: float) -> float:
+        """Compute the percentile of a salary in current distribution."""
+        if salary <= 0:
+            return 0.0
+            
+        # Normalize salary based on location
+        normalized_salary = salary / self.context["location"]["cost_modifier"]
+            
+        # Extract current parameters
+        mu = self.salary_model['mu']
+        alpha = self.salary_model['alpha']
+        beta = self.salary_model['beta']
+        
+        # Compute degrees of freedom
+        df = 2 * alpha
+        
+        # Compute scale parameter
+        scale = math.sqrt(beta / alpha)
+        
+        # Approximate with normal distribution
+        return norm.cdf(normalized_salary, loc=mu, scale=scale)
+    
+    def _update_market_model_with_rejection(self, salary_percentile: float, low_attributes: List[str]):
+        """Update market model based on rejection pattern."""
+        # If high salary percentile was rejected, market might be weak
+        if salary_percentile > 0.7:
+            # Evidence of weak market (candidates can't be too picky)
+            self.market_model['beta'] += 0.5
+        elif salary_percentile < 0.3 and len(low_attributes) > 0:
+            # Evidence of strong market (candidates can be picky)
+            self.market_model['alpha'] += 0.5
+    
+    def generate_salary_sample(self) -> float:
+        """Generate a salary sample from current beliefs with semantic understanding."""
+        # Extract current parameters
+        mu = self.salary_model['mu']
+        alpha = self.salary_model['alpha']
+        beta = self.salary_model['beta']
+        
+        # Generate salary from t-distribution (more robust than normal)
+        if alpha > 1:
+            # Scale parameter
+            scale = math.sqrt(beta / (alpha - 1))
+            
+            # Degrees of freedom
+            df = 2 * alpha
+            
+            # Sample from t-distribution
+            t_sample = np.random.standard_t(df)
+            salary_sample = mu + scale * t_sample
+        else:
+            # Fall back to normal if alpha too small
+            std = math.sqrt(beta)
+            salary_sample = np.random.normal(mu, std)
+        
+        # Apply location adjustment
+        adjusted_salary = salary_sample * self.context["location"]["cost_modifier"]
+        
+        # Ensure reasonable bounds
+        return max(self.user_preferences.get("min_salary", 30000), adjusted_salary)
+    
+    def generate_attribute_sample(self, attr_name: str) -> float:
+        """Generate attribute sample from current beliefs."""
+        if attr_name not in self.attribute_models:
+            return 5.0  # Default for unknown attributes
+        
+        # Extract current parameters
+        alpha = self.attribute_models[attr_name]['alpha']
+        beta = self.attribute_models[attr_name]['beta']
+        
+        # Sample from Beta distribution (0-1 scale)
+        value_0_1 = np.random.beta(alpha, beta)
+        
+        # Get variable type
+        var_type = VARIABLE_TYPES.get(attr_name)
+        if not var_type:
+            # Default to 1-10 scale
+            return 1 + 9 * value_0_1
+            
+        # Convert to appropriate scale based on variable type
+        if var_type.var_type == "quality" or var_type.var_type == "alignment":
+            return 1 + 9 * value_0_1  # 0-1 to 1-10 scale
+        elif var_type.var_type == "boolean":
+            return 10 * value_0_1  # 0-1 to 0-10 scale
+        else:
+            return 1 + 9 * value_0_1  # Default to 1-10 scale
+    
+    def get_market_condition(self, time_point: float) -> float:
+        """Get current market condition with semantic understanding."""
+        # Base market strength from Beta distribution
+        alpha = self.market_model['alpha']
+        beta = self.market_model['beta']
+        market_strength = alpha / (alpha + beta)
+        
+        # Apply seasonal adjustment
         week_of_year = int(time_point * 52) % 52
-        season_index = (week_of_year // 3) % 16  # 16 3-week periods
+        season_index = (week_of_year // 3) % 16
         seasonal_factor = self.seasonality_factors[season_index]
         
-        # Add random walk component for market changes
-        random_walk = np.random.normal(0, self.market_volatility)
+        # Adjust based on field-specific factors
+        field = self.user_profile.get("field", "general")
+        field_factor = 1.0
         
-        # Update market condition
-        self.market_condition = max(0.5, min(1.5, 
-            self.market_condition * seasonal_factor + random_walk))
+        # Some fields have more seasonal variation than others
+        if field == "education":
+            # Education hiring follows academic year strongly
+            seasonal_factor = seasonal_factor ** 1.5
+        elif field == "retail":
+            # Retail has even stronger seasonality
+            seasonal_factor = seasonal_factor ** 2
+        elif field == "software_engineering":
+            # Tech tends to be less seasonal
+            seasonal_factor = seasonal_factor ** 0.5
+        
+        # Final market condition
+        adjusted_condition = market_strength * seasonal_factor * field_factor
+        
+        # Ensure reasonable range
+        return max(0.5, min(1.5, adjusted_condition))
     
-    def _update_skills(self, time_point: float):
-        """
-        Update the candidate's skills based on time passed.
+    def generate_job_offer(self, time_point: float) -> Dict[str, Any]:
+        """Generate a job offer based on current beliefs with semantic understanding."""
+        # Generate company and position appropriate for the field
+        field = self.user_profile.get("field", "general")
         
-        Args:
-            time_point: Current time point (0-1 scale)
-        """
-        # Calculate time passed since last update
-        time_passed = time_point - self.last_update_time
-        self.last_update_time = time_point
+        field_companies = {
+            "software_engineering": [
+                "TechInnovate", "CodeCraft", "ByteBuilders", "CloudCore", "AIVentures"
+            ],
+            "data_science": [
+                "DataDynamics", "QuantumQueries", "AIVentures", "Analytica", "DataCore"
+            ],
+            "marketing": [
+                "BrandBurst", "MarketMind", "EngageNow", "DigitalDomains", "MediaMakers"
+            ],
+            "finance": [
+                "CapitalCore", "FinanceFirst", "WealthWise", "InvestRight", "FiscalFocus"
+            ],
+            "general": [
+                "GeneriCorp", "AllFields", "BusinessBasics", "CorporateConcepts", "EnterpriseCo"
+            ]
+        }
         
-        # Increase the candidate desirability due to skill growth
-        # More learning happens when actively searching
-        self.negotiation_model['candidate_desirability'] *= (1 + self.skill_growth_rate * time_passed)
-    
-    def _update_interview_model(self, offer: JobOffer, success: bool):
-        """
-        Update our model of interview success probability.
+        field_positions = {
+            "software_engineering": [
+                "Software Engineer", "Frontend Developer", "Backend Developer", 
+                "DevOps Engineer", "Full Stack Developer"
+            ],
+            "data_science": [
+                "Data Scientist", "ML Engineer", "Data Analyst", 
+                "Data Engineer", "Research Scientist"
+            ],
+            "marketing": [
+                "Marketing Manager", "Digital Marketer", "Content Strategist",
+                "Brand Manager", "Social Media Specialist"
+            ],
+            "finance": [
+                "Financial Analyst", "Investment Banker", "Accountant",
+                "Finance Manager", "Financial Advisor"
+            ],
+            "general": [
+                "Business Analyst", "Project Manager", "Operations Manager",
+                "HR Specialist", "Office Manager"
+            ]
+        }
         
-        Args:
-            offer: The job offer that resulted from the interview
-            success: Whether the interview was successful
-        """
-        # Extract features from the offer that might predict interview success
-        features = [
-            offer.salary / self.current_salary,  # Normalized salary
-            offer.career_growth / 5.0,           # Normalized career growth
-            offer.company_reputation / 5.0,      # Normalized company reputation
-            offer.tech_stack_match / 5.0,        # Normalized tech stack match
-        ]
+        # Get companies and positions for this field (or fall back to general)
+        companies = field_companies.get(field, field_companies["general"])
+        positions = field_positions.get(field, field_positions["general"])
         
-        # Add to training data
-        self.interview_outcomes.append((features, 1.0 if success else 0.0))
-        
-        # Only retrain if we have enough data
-        if len(self.interview_outcomes) >= 5:
-            X = np.array([f for f, _ in self.interview_outcomes])
-            y = np.array([o for _, o in self.interview_outcomes])
-            
-            # Train the Gaussian Process model
-            self.interview_gp.fit(X, y)
-    
-    def predict_interview_success(self, offer: JobOffer) -> float:
-        """
-        Predict the probability of success with a given job offer interview.
-        
-        Args:
-            offer: The job offer to predict success for
-            
-        Returns:
-            Probability of interview success (0-1)
-        """
-        # If we don't have enough data, return a default value
-        if len(self.interview_outcomes) < 5:
-            return 0.5
-        
-        # Extract features
-        features = np.array([[
-            offer.salary / self.current_salary,
-            offer.career_growth / 5.0,
-            offer.company_reputation / 5.0,
-            offer.tech_stack_match / 5.0,
-        ]])
-        
-        # Predict using the GP model
-        pred, std = self.interview_gp.predict(features, return_std=True)
-        
-        # Bound the prediction between 0 and 1
-        return max(0, min(1, pred[0]))
-    
-    def generate_job_offer(self, time_point: float) -> JobOffer:
-        """
-        Generate a realistic job offer based on current market model.
-        
-        Args:
-            time_point: Current time point (0-1 scale)
-            
-        Returns:
-            A generated job offer
-        """
-        # Generate company name
-        companies = [
-            "TechInnovate", "DataDynamics", "CodeCraft", "ByteBuilders", "QuantumQueries",
-            "CyberSolutions", "CloudCore", "AIVentures", "WebWizards", "DevDreams",
-            "SystemSage", "NetNavigators", "InfoInnovators", "SoftwareSynergy", "TechTrend",
-            "DigitalDomain", "ByteBrilliance", "CodeConnect", "AppArchitects", "SecuritySystems",
-            "MobileMasters", "AnalyticsAdvance", "QuantumQuest", "IntelImpact", "VirtualVanguard"
-        ]
         company = random.choice(companies)
+        position = random.choice(positions)
         
-        # Generate salary from our Bayesian model
-        # First, decide which mixture component to use
-        component = np.random.choice(len(self.salary_means), p=self.salary_weights)
+        # Get market condition
+        market_condition = self.get_market_condition(time_point)
         
-        # Then generate from that normal distribution
-        mean = self.salary_means[component] * self.market_condition
-        std = self.salary_stds[component]
-        salary = max(10000, np.random.normal(mean, std))
+        # Generate salary based on current beliefs and market
+        base_salary = self.generate_salary_sample() * market_condition
         
-        # Generate job attributes from our Beta distributions
-        attributes = {}
-        for attr, (alpha, beta) in self.attribute_priors.items():
-            # Generate from Beta distribution and convert to 1-5 scale
-            value_0_1 = np.random.beta(alpha, beta)
-            value_1_5 = max(1, min(5, round(1 + 4 * value_0_1)))
-            attributes[attr] = value_1_5
+        # Create offer
+        offer = {
+            "company": company,
+            "position": position,
+            "base_salary": base_salary,
+            "total_compensation": base_salary * (1 + random.uniform(0.1, 0.3))
+        }
+        
+        # Decide offer quality profile
+        offer_quality = random.choices(
+            ["good", "mixed", "bad"], 
+            weights=[0.3, 0.5, 0.2]  # 30% good, 50% mixed, 20% bad
+        )[0]
+        
+        # Add attributes based on semantic understanding
+        for attr_name, var_type in VARIABLE_TYPES.items():
+            # Skip monetary attributes (already handled)
+            if attr_name in ["base_salary", "total_compensation"]:
+                continue
             
-        # Apply strategic employer behavior
-        # If the candidate is more desirable, the salary offered might be higher
-        salary *= self.negotiation_model['candidate_desirability']
-        
-        # If the employer is urgent to fill, they might offer more
-        urgency_bonus = 1.0 + (0.1 * self.negotiation_model['urgency_to_fill'])
-        salary *= urgency_bonus
-        
-        # Employers typically lowball initial offers
-        salary *= self.negotiation_model['initial_lowball_factor']
-        
-        # Set negotiation flexibility
-        negotiation_flexibility = max(0, min(1, 
-            0.15 * (1 + self.negotiation_model['urgency_to_fill']) - 
-            0.05 * self.negotiation_model['candidate_desirability']))
+            # Skip attributes not applicable to this field
+            if attr_name in self.context["field"] and \
+               "applicable" in self.context["field"][attr_name] and \
+               not self.context["field"][attr_name]["applicable"]:
+                continue
             
-        # Create and return the job offer
-        return JobOffer(
-            company=company,
-            salary=salary,
-            career_growth=attributes.get('career_growth', 3),
-            location_score=attributes.get('location_score', 3),
-            work_life_balance=attributes.get('work_life_balance', 3),
-            company_reputation=attributes.get('company_reputation', 3),
-            role_responsibilities=attributes.get('role_responsibilities', 3),
-            ai_component=attributes.get('ai_component', 3),
-            tech_stack_match=attributes.get('tech_stack_match', 3),
-            mentoring_opportunity=attributes.get('mentoring_opportunity', 3),
-            project_variety=attributes.get('project_variety', 3),
-            team_collaboration=attributes.get('team_collaboration', 3),
-            negotiation_flexibility=negotiation_flexibility
-        )
+            # Generate attribute value based on offer quality
+            base_value = self.generate_attribute_sample(attr_name)
+            
+            if offer_quality == "good":
+                # Boost values for good offers
+                attr_value = min(10, base_value + random.uniform(0, 3))
+            elif offer_quality == "bad":
+                # Reduce values for bad offers
+                attr_value = max(1, base_value - random.uniform(0, 3))
+            else:  # mixed
+                # More variability for mixed offers
+                attr_value = max(1, min(10, base_value + random.uniform(-2, 2)))
+            
+            offer[attr_name] = attr_value
+        
+        return offer
+    
+    def get_expected_salary_range(self) -> Tuple[float, float]:
+        """Get the expected range for salary with semantic understanding."""
+        mu = self.salary_model['mu']
+        alpha = self.salary_model['alpha']
+        beta = self.salary_model['beta']
+        
+        # If we have enough data, use t-distribution
+        if alpha > 1:
+            # Compute standard deviation
+            std = math.sqrt(beta / (alpha - 1))
+            
+            # 90% confidence interval
+            return (mu - 1.645 * std, mu + 1.645 * std)
+        else:
+            # Not enough data, use wide range
+            return (mu * 0.7, mu * 1.3)
+    
+    def get_attribute_expectation(self, attr_name: str) -> float:
+        """Get the expected value for an attribute with semantic understanding."""
+        if attr_name not in self.attribute_models:
+            return 5.0  # Default middle value
+        
+        alpha = self.attribute_models[attr_name]['alpha']
+        beta = self.attribute_models[attr_name]['beta']
+        
+        # Expected value of Beta distribution
+        expected_value = alpha / (alpha + beta)
+        
+        # Get variable type
+        var_type = VARIABLE_TYPES.get(attr_name)
+        if not var_type:
+            # Default to 1-10 scale
+            return 1 + 9 * expected_value
+            
+        # Convert to appropriate scale based on variable type
+        if var_type.var_type == "quality" or var_type.var_type == "alignment":
+            return 1 + 9 * expected_value  # 0-1 to 1-10 scale
+        elif var_type.var_type == "boolean":
+            return 10 * expected_value  # 0-1 to 0-10 scale
+        else:
+            return 1 + 9 * expected_value  # Default to 1-10 scale
 
+# ===========================================================================
+# 5. ENHANCED OPTIMAL STOPPING ALGORITHM
+# ===========================================================================
 
-class ContinuousTimeOST:
+class SemanticOST:
     """
-    Advanced Optimal Stopping Theory implementation using continuous time stochastic 
-    processes and Bayesian updating.
+    Enhanced Optimal Stopping Theory with semantic understanding of job variables
+    and context-aware decision making.
     """
     
-    def __init__(self, preferences: dict, max_time: float = 1.0, time_units: str = "years"):
-        """
-        Initialize the continuous time optimal stopping model.
-        
-        Args:
-            preferences: User preferences dictionary
-            max_time: Maximum time horizon for job search (in chosen units)
-            time_units: String description of time units (for display)
-        """
-        self.preferences = preferences
+    def __init__(self, user_profile: Dict[str, Any], user_preferences: Dict[str, Any], 
+                max_time: float = 1.0, time_units: str = "years"):
+        """Initialize the enhanced semantic OST model."""
+        self.user_profile = user_profile
+        self.user_preferences = user_preferences
         self.max_time = max_time
         self.time_units = time_units
         
-        # Create job market model
-        self.job_market = BayesianJobMarketModel(preferences)
+        # Create enhanced preference processor with semantic understanding
+        self.preference_processor = EnhancedPreferenceProcessor(user_profile, user_preferences)
+        
+        # Create enhanced Bayesian belief model
+        self.belief_model = EnhancedBayesianModel(user_profile, user_preferences)
+        
+        # Extract key parameters with semantic understanding
+        self.current_salary = user_preferences.get('current_salary', 40000)
+        self.min_salary = user_preferences.get('min_salary', 30000)
+        # MODIFICATION 2: Increase financial runway
+        self.financial_runway = user_preferences.get('financial_runway', 12) / 12  # Convert months to years
+        self.risk_tolerance = user_preferences.get('risk_tolerance', 5) / 10  # Normalize to 0-1
+        self.job_search_urgency = user_preferences.get('job_search_urgency', 5) / 10  # Normalize to 0-1
+        self.employment_status = user_profile.get('employment_status', 'employed')
         
         # Financial parameters
-        self.current_salary = preferences.get('current_salary', 25000)
-        self.financial_runway = preferences.get('financial_runway', 3) / 12  # Convert months to years
-        self.discount_rate = 0.05  # Annual discount rate for future cash flows
+        self.discount_rate = 0.05  # Annual discount rate
+        # MODIFICATION 3: Reduce search costs
+        self.search_cost_rate = self.current_salary * 0.02  # Base cost of searching (was 0.05)
+        self.offer_arrival_rate = 12  # Expected offers per year
         
-        # Psychological parameters
-        self.job_search_urgency = preferences.get('job_search_urgency', 5) / 10  # Normalize to 0-1
-        self.risk_tolerance = preferences.get('risk_tolerance', 5) / 10  # Normalize to 0-1
-        self.optimism_factor = 0.5 + (self.risk_tolerance * 0.5)  # Optimism correlates with risk tolerance
+        # Adjust parameters based on employment status
+        if self.employment_status == 'unemployed':
+            self.search_cost_rate = self.min_salary * 0.1  # Higher opportunity cost when unemployed
+            self.discount_rate = 0.1  # Higher time pressure
         
-        # Search parameters
-        self.search_cost_rate = self.current_salary * 0.05  # Cost of searching (money, effort, stress)
-        self.offer_arrival_rate = 12  # Expected number of offers per year
+        # Transaction costs (with semantic understanding)
+        self.interview_cost = 0.005 * self.current_salary  # Cost per interview (time, preparation)
+        self.rejection_cost = 0.001 * self.current_salary  # Reputation cost of rejecting an offer
+        self.fatigue_factor = 1.0  # Increases with each interview
         
         # State variables
         self.current_time = 0.0
         self.best_offer_so_far = None
         self.best_utility_so_far = -float('inf')
         self.observed_offers = []
+        self.rejections_made = 0
         
-        # Offer negotiation model
-        self.negotiation_success_rate = 0.7  # Probability of successful negotiation
-        self.negotiation_improvement = 0.05  # Average improvement from negotiation
-        
-        # Value function approximation
+        # Value function and thresholds
         self.time_grid = np.linspace(0, max_time, 100)
         self.value_function = np.zeros_like(self.time_grid)
         self.reservation_utilities = np.zeros_like(self.time_grid)
         
-        # Initialize the value function and reservation utilities
+        # Initialize the value function and thresholds
         self._initialize_value_function()
     
     def _initialize_value_function(self):
-        """Initialize the value function using backward induction."""
-        # Initialize terminal value
+        """Initialize the value function and reservation utilities using backward induction."""
+        # Terminal value is 0
         self.value_function[-1] = 0
         
-        # Backward induction
+        # # MODIFICATION 9: Add initial debugging information
+        # print("\nDEBUG: Starting value function calculation")
+        # print(f"  Discount rate: {self.discount_rate:.4f}")
+        # print(f"  Search cost rate: {self.search_cost_rate:.2f}")
+        # print(f"  Offer arrival rate: {self.offer_arrival_rate:.2f}")
+        # print(f"  Financial runway: {self.financial_runway:.2f} years")
+        
+        # Backward induction with semantic understanding
         for i in range(len(self.time_grid) - 2, -1, -1):
             t = self.time_grid[i]
             dt = self.time_grid[i+1] - t
             
-            # Expected utility calculation
-            expected_improvement = self._expected_improvement_from_continuing(t)
+            # Expected improvement from continuing
+            expected_improvement = self._expected_improvement(t)
             
-            # Update value function, accounting for:
-            # 1. Time value of money (discounting)
-            # 2. Search costs
-            # 3. Financial runway constraints
-            # 4. Market condition changes
-            discounted_next_value = self.value_function[i+1] * np.exp(-self.discount_rate * dt)
-            search_cost = self.search_cost_rate * dt
+            # MODIFICATION 10: Fix numerical instability in value function
+            # When calculating discounted_next_value, check if next value is unreasonably negative
+            next_value = self.value_function[i+1]
+            if next_value < -100:
+                next_value = -100  # Limit the cascade of negative values
             
-            # Value of continuing the search
-            continuing_value = expected_improvement + discounted_next_value - search_cost
+            # Discounted future value
+            discounted_next_value = next_value * np.exp(-self.discount_rate * dt)
             
-            # Adjust for financial runway
-            time_remaining_factor = max(0, (self.financial_runway - t) / self.financial_runway)
-            if time_remaining_factor <= 0:
-                # Financial pressure when runway is depleted
-                runway_penalty = search_cost * (1 + 0.5 * (1 - self.risk_tolerance))
+            # Search cost with fatigue component and semantic understanding
+            fatigue_multiplier = 1 + (self.fatigue_factor - 1) * (t / self.max_time)
+            
+            # Adjust search cost based on employment status
+            if self.employment_status == 'employed':
+                # Employed people have lower search costs but higher opportunity costs
+                search_cost = self.search_cost_rate * dt * fatigue_multiplier * 0.8
+            else:
+                # Unemployed can search more intensively but financial pressure is higher
+                search_cost = self.search_cost_rate * dt * fatigue_multiplier * 1.2
+            
+            # Interview cost with semantic understanding
+            interview_cost = self.interview_cost * self.offer_arrival_rate * dt
+            
+            # Total cost
+            total_cost = search_cost + interview_cost
+            
+            # Value of continuing
+            continuing_value = expected_improvement + discounted_next_value - total_cost
+            
+            # Adjust for financial runway with semantic understanding
+            if t > self.financial_runway:
+                # Financial pressure depends on employment status
+                if self.employment_status == 'unemployed':
+                    # Severe penalty for unemployed past runway
+                    runway_penalty = search_cost * (2 + (1 - self.risk_tolerance))
+                else:
+                    # Moderate penalty for employed past runway
+                    runway_penalty = search_cost * (1 + 0.5 * (1 - self.risk_tolerance))
+                    
                 continuing_value -= runway_penalty
             
-            # Adjust for search urgency
-            urgency_adjustment = (t / self.max_time) * self.job_search_urgency * expected_improvement * 0.5
+            # Adjust for search urgency and career considerations
+            field_urgency_factor = 1.0
+            if self.user_profile.get('field') == 'technology':
+                # Technology field has higher cost of career gaps
+                field_urgency_factor = 1.2
+            
+            urgency_adjustment = (t / self.max_time) * self.job_search_urgency * \
+                              expected_improvement * 0.5 * field_urgency_factor
             continuing_value -= urgency_adjustment
             
-            # Store the continuing value
+            # MODIFICATION 11: Limit how negative the value function can get
+            continuing_value = max(-100, continuing_value)
+            
+            # Store value
             self.value_function[i] = continuing_value
             
-            # Calculate the reservation utility - threshold for accepting an offer
+            # MODIFICATION 12: Debug every 20 iterations and first/last 5
+            # if i % 20 == 0 or i > len(self.time_grid) - 5 or i < 5:
+            #     print(f"\nIteration {i}, t = {t:.2f}:")
+            #     print(f"  Expected improvement: {expected_improvement:.2f}")
+            #     print(f"  Next value: {next_value:.2f}, discount factor: {np.exp(-self.discount_rate * dt):.4f}")
+            #     print(f"  Discounted next value: {discounted_next_value:.2f}")
+            #     print(f"  Total cost: {total_cost:.2f}")
+            #     print(f"  Continuing value: {continuing_value:.2f}")
+            
+            # Calculate reservation utility
             self.reservation_utilities[i] = self._calculate_reservation_utility(t, continuing_value)
+            
+            # MODIFICATION 7: Add debug output for threshold calculation 
+            # if i == 0:  # Only for first timestep
+            #     print("\nTHRESHOLD CALCULATION FACTORS:")
+            #     print(f"  Expected improvement: {expected_improvement:.2f}")
+            #     print(f"  Discounted next value: {discounted_next_value:.2f}")
+            #     print(f"  Total search cost: {total_cost:.2f}")
+            #     print(f"  Fatigue multiplier: {fatigue_multiplier:.2f}")
+            #     print(f"  Urgency adjustment: {urgency_adjustment:.2f}")
+            #     if t > self.financial_runway:
+            #         print(f"  Runway penalty: {runway_penalty:.2f}")
+            #     print(f"  Continuing value: {continuing_value:.2f}")
     
-    def _expected_improvement_from_continuing(self, t: float) -> float:
-        """Calculate the expected improvement in utility from continuing the search."""
-        # Generate sample offers to estimate expected value
-        n_samples = 100
-        sample_offers = [self.job_market.generate_job_offer(t) for _ in range(n_samples)]
-        sample_utilities = [offer.calculate_utility(self.preferences) for offer in sample_offers]
+    def _expected_improvement(self, t: float) -> float:
+        """Calculate expected improvement with semantic understanding."""
+        # Generate sample offers using enhanced Bayesian model
+        n_samples = 50
+        sample_offers = [self.belief_model.generate_job_offer(t) for _ in range(n_samples)]
+        sample_utilities = [self.preference_processor.calculate_offer_utility(offer) for offer in sample_offers]
         
-        # If we have a best offer so far, we only benefit from better offers
-        if self.best_offer_so_far:
-            best_utility = self.best_offer_so_far.calculate_utility(self.preferences)
-            improvements = [max(0, u - best_utility) for u in sample_utilities]
+        # If we have a best offer, only count improvements
+        if self.best_utility_so_far > -float('inf'):
+            improvements = [max(0, u - self.best_utility_so_far) for u in sample_utilities]
         else:
-            improvements = [max(0, u) for u in sample_utilities]
+            improvements = sample_utilities
         
-        # Expected improvement adjusted for arrival rate
-        arrival_prob = 1 - np.exp(-self.offer_arrival_rate * (self.max_time - t) / 100)
-        expected_improvement = np.mean(improvements) * arrival_prob
+        # Expected improvement with semantically-aware arrival probability
+        base_arrival_prob = 1 - np.exp(-self.offer_arrival_rate * (self.max_time - t) / 100)
+        
+        # Adjust based on field and market condition
+        market_condition = self.belief_model.get_market_condition(t)
+        field = self.user_profile.get('field', 'general')
+        
+        # Field-specific arrival rate adjustments
+        field_factor = 1.0
+        if field == 'software_engineering':
+            field_factor = 1.2  # More opportunities in tech
+        elif field == 'finance':
+            field_factor = 0.9  # More competitive, fewer offers
+        
+        # Final arrival probability
+        adjusted_arrival_prob = base_arrival_prob * market_condition * field_factor
+        
+        expected_improvement = np.mean(improvements) * adjusted_arrival_prob
+        
+        # MODIFICATION 4: Boost expected improvement
+        expected_improvement *= 1.5  # Boost by 50%
         
         return expected_improvement
     
     def _calculate_reservation_utility(self, t: float, continuing_value: float) -> float:
-        """
-        Calculate the reservation utility (optimal stopping threshold) at time t.
+        """Calculate reservation utility with semantic understanding."""
+        # MODIFICATION 13: Complete redesign of reservation utility calculation
+        # Instead of using continuing_value (which has numerical issues),
+        # calculate based on mean utility of sample offers
         
-        Args:
-            t: Current time point
-            continuing_value: Value of continuing the search
+        # Generate sample offers to get baseline statistics
+        n_samples = 30
+        sample_offers = [self.belief_model.generate_job_offer(t) for _ in range(n_samples)]
+        sample_utilities = [self.preference_processor.calculate_offer_utility(offer) for offer in sample_offers]
+        
+        # Sort utilities to find distribution
+        sorted_utilities = sorted(sample_utilities)
+        
+        # Use 40th percentile as baseline reservation utility (somewhat selective)
+        percentile_idx = int(0.4 * len(sorted_utilities))
+        base_reservation = sorted_utilities[percentile_idx]
+        
+        # Get context-aware market condition
+        market_condition = self.belief_model.get_market_condition(t)
+        
+        # Get adjustment factors - all normalized around 1.0
+        risk_factor = self._get_risk_factor()
+        time_factor = self._get_time_factor(t)
+        runway_factor = self._get_runway_factor(t)
+        market_factor = self._get_market_factor(market_condition)
+        rejection_factor = self._get_rejection_factor()
+        field_factor = self._get_field_factor()
+        experience_factor = self._get_experience_factor()
+        
+        # Apply all adjustment factors to base reservation utility
+        adjusted_utility = base_reservation * risk_factor * time_factor * runway_factor * \
+                        market_factor * rejection_factor * field_factor * \
+                        experience_factor
+        
+        # MODIFICATION 5: Boost reservation utility directly
+        adjusted_utility += 1.0  # Add a flat boost to make more selective
+        
+        # Lower bound based on risk tolerance and employment status
+        if self.employment_status == 'unemployed':
+            # Lower floor when unemployed - can't be as selective
+            min_acceptable = 0 * (1 - self.risk_tolerance)
+        else:
+            min_acceptable = 2 * (1 - self.risk_tolerance)
+        
+        # Debug output for this calculation
+        # if t < 0.1:  # Only for early time points
+        #     print(f"\nRESERVATION UTILITY CALCULATION:")
+        #     print(f"  Sample utilities: min={min(sample_utilities):.2f}, " +
+        #           f"mean={np.mean(sample_utilities):.2f}, max={max(sample_utilities):.2f}")
+        #     print(f"  Base reservation (40th percentile): {base_reservation:.2f}")
+        #     print(f"  Risk factor: {risk_factor:.2f}")
+        #     print(f"  Time factor: {time_factor:.2f}")
+        #     print(f"  Runway factor: {runway_factor:.2f}")
+        #     print(f"  Market factor: {market_factor:.2f}")
+        #     print(f"  Rejection factor: {rejection_factor:.2f}")
+        #     print(f"  Field factor: {field_factor:.2f}")
+        #     print(f"  Experience factor: {experience_factor:.2f}")
+        #     print(f"  After adjustments: {adjusted_utility:.2f}")
+        #     print(f"  Min acceptable: {min_acceptable:.2f}")
+        #     print(f"  Final reservation utility: {max(min_acceptable, adjusted_utility):.2f}")
             
-        Returns:
-            The reservation utility (threshold for accepting an offer)
-        """
-        # Basic reservation utility is the value of continuing
-        reservation_utility = continuing_value
-        
-        # Adjust for time remaining
-        time_factor = 1.0
-        if t < 0.2 * self.max_time:
-            # Be more selective in early phases
-            time_factor = 1.2
-        elif t > 0.8 * self.max_time:
-            # Be less selective near the end
+        return max(min_acceptable, adjusted_utility)
+    
+    def _get_risk_factor(self) -> float:
+        """Get risk adjustment factor based on risk tolerance."""
+        if self.risk_tolerance > 0.7:  # High risk tolerance
+            return 1.2  # Higher threshold - more selective
+        elif self.risk_tolerance < 0.3:  # Low risk tolerance
+            return 0.8  # Lower threshold - less selective
+        else:
+            return 1.0  # Neutral
+    
+    def _get_time_factor(self, t: float) -> float:
+        """Get time adjustment factor with field-specific considerations."""
+        # MODIFICATION 8: Make time effect more beneficial
+        if t < 0.3 * self.max_time:
+            # Stay more selective longer in early phase
+            time_factor = 1.5  # Increased from 1.2
+        elif t > 0.9 * self.max_time:
+            # Only reduce selectivity at very end
             time_factor = 0.8
+        else:
+            time_factor = 1.2  # Stay more selective in middle phase
         
-        # Adjust for financial runway
+        # Field-specific adjustments
+        field = self.user_profile.get('field', 'general')
+        if field == 'seasonal':
+            # For highly seasonal fields, timing is more important
+            if t < 0.2 * self.max_time or t > 0.8 * self.max_time:
+                time_factor *= 1.2
+        
+        return time_factor
+    
+    def _get_runway_factor(self, t: float) -> float:
+        """Get financial runway adjustment factor with semantic understanding."""
         runway_remaining = self.financial_runway - t
-        runway_factor = 1.0
+        
+        # Base factor
         if runway_remaining < 0:
             # Much less selective once runway is gone
             runway_factor = 0.5
         elif runway_remaining < 0.2:
             # Somewhat less selective when runway is low
             runway_factor = 0.8
+        else:
+            runway_factor = 1.0
         
-        # Adjust for market conditions (if rapidly worsening, be less selective)
-        season_idx = int((t * 52) // 3) % 16
-        current_factor = self.job_market.seasonality_factors[season_idx]
-        next_idx = (season_idx + 1) % 16
-        next_factor = self.job_market.seasonality_factors[next_idx]
-        market_trend = next_factor / current_factor
+        # Employment status affects runway pressure
+        # MODIFICATION 6: Modify unemployment penalty
+        if self.employment_status == 'unemployed':
+            # Less penalty for being unemployed (was 0.9)
+            runway_factor *= 0.95
         
-        market_factor = 1.0
-        if market_trend < 0.95:
-            # Market worsening - be less selective
-            market_factor = 0.9
-        elif market_trend > 1.05:
-            # Market improving - be more selective
-            market_factor = 1.1
+        return runway_factor
+    
+    def _get_market_factor(self, market_condition: float) -> float:
+        """Get market adjustment factor with semantic understanding."""
+        if market_condition < 0.9:
+            # Weaker market - be less selective
+            return 0.9
+        elif market_condition > 1.1:
+            # Stronger market - be more selective
+            return 1.1
+        else:
+            return 1.0
+    
+    def _get_rejection_factor(self) -> float:
+        """Get adjustment factor based on rejection history."""
+        # More rejections = less selective
+        return max(0.8, 1.0 - 0.05 * self.rejections_made)
+    
+    def _get_field_factor(self) -> float:
+        """Get field-specific adjustment factor."""
+        field = self.user_profile.get('field', 'general')
         
-        # Final adjusted reservation utility
-        adjusted_utility = reservation_utility * time_factor * runway_factor * market_factor
+        if field == 'software_engineering':
+            # Tech has more options - can be more selective
+            return 1.1
+        elif field == 'academic':
+            # Academic jobs are scarce - be less selective
+            return 0.9
+        else:
+            return 1.0
+    
+    def _get_experience_factor(self) -> float:
+        """Get experience-level adjustment factor."""
+        experience = self.user_profile.get('experience_level', 'mid')
         
-        # Lower bound - never accept terrible offers
-        min_acceptable = -5 * (1 - self.risk_tolerance)
-        
-        return max(min_acceptable, adjusted_utility)
+        if experience == 'entry':
+            # Entry-level can't be as selective
+            return 0.9
+        elif experience == 'senior' or experience == 'executive':
+            # Senior roles are more selective
+            return 1.1
+        else:
+            return 1.0
     
     def get_reservation_utility(self, t: float) -> float:
-        """
-        Get the reservation utility (acceptance threshold) at time t.
-        
-        Args:
-            t: Current time point
-            
-        Returns:
-            The reservation utility at time t
-        """
-        # Find the closest point in our grid
+        """Get the reservation utility at time t."""
         idx = np.argmin(np.abs(self.time_grid - t))
         return self.reservation_utilities[idx]
     
-    def should_accept_offer(self, offer: JobOffer, t: float, attempt_negotiation: bool = True) -> Tuple[bool, str]:
+    def calculate_offer_utility(self, offer: Dict[str, Any]) -> float:
+        """Calculate offer utility with semantic understanding."""
+        return self.preference_processor.calculate_offer_utility(offer)
+    
+    def should_accept_offer(self, offer: Dict[str, Any], t: float) -> Tuple[bool, str, Dict[str, Any]]:
         """
-        Determine whether to accept a job offer, potentially after negotiation.
+        Determine whether to accept a job offer with semantic understanding.
         
         Args:
-            offer: The job offer to evaluate
+            offer: The job offer data
             t: Current time point
-            attempt_negotiation: Whether to attempt negotiation
             
         Returns:
-            Tuple of (decision, explanation)
+            Tuple of (accept_decision, reason, decision_details)
         """
-        # Calculate the utility of this offer
-        utility = offer.calculate_utility(self.preferences)
+        # MODIFICATION 14: Completely redesign decision logic to properly use thresholds
         
-        # Get the reservation utility at this time
-        reservation_utility = self.get_reservation_utility(t)
+        # First check hard constraints
+        meets_constraints, constraint_reason = self.preference_processor.check_hard_constraints(offer)
+        if not meets_constraints:
+            return False, constraint_reason, {"hard_constraint_violation": True}
         
-        # Check if offer exceeds best so far
-        improves_on_best = False
-        if self.best_offer_so_far:
-            best_utility = self.best_offer_so_far.calculate_utility(self.preferences)
-            improves_on_best = utility > best_utility
-        else:
-            improves_on_best = utility > 0
+        # Calculate offer utility
+        utility = self.calculate_offer_utility(offer)
         
-        # If offer isn't good enough, try negotiation
-        negotiated_utility = utility
-        negotiation_message = ""
+        # Get current threshold
+        threshold = self.get_reservation_utility(t)
         
-        if attempt_negotiation and offer.negotiation_flexibility > 0:
-            potential_improvement = offer.negotiation_flexibility * self.negotiation_improvement
-            if np.random.random() < self.negotiation_success_rate:
-                # Successful negotiation
-                improved_salary = offer.salary * (1 + potential_improvement)
-                
-                # Create a new offer with the improved salary
-                negotiated_offer = JobOffer(
-                    company=offer.company,
-                    salary=improved_salary,
-                    career_growth=offer.career_growth,
-                    location_score=offer.location_score,
-                    work_life_balance=offer.work_life_balance,
-                    company_reputation=offer.company_reputation,
-                    role_responsibilities=offer.role_responsibilities,
-                    ai_component=offer.ai_component,
-                    tech_stack_match=offer.tech_stack_match,
-                    mentoring_opportunity=offer.mentoring_opportunity,
-                    project_variety=offer.project_variety,
-                    team_collaboration=offer.team_collaboration,
-                    negotiation_flexibility=0  # Used up flexibility
-                )
-                
-                # Calculate new utility
-                negotiated_utility = negotiated_offer.calculate_utility(self.preferences)
-                negotiation_message = f"Negotiation successful: Salary increased from £{offer.salary:,.2f} to £{improved_salary:,.2f}"
-            else:
-                negotiation_message = "Negotiation attempted but unsuccessful"
+        # Get market condition
+        market_condition = self.belief_model.get_market_condition(t)
         
-        # Decision logic
-        if negotiated_utility >= reservation_utility:
-            if improves_on_best:
-                return True, f"Accept: Utility ({negotiated_utility:.2f}) exceeds threshold ({reservation_utility:.2f}) and improves on best offer. {negotiation_message}"
-            else:
-                return True, f"Accept: Utility ({negotiated_utility:.2f}) exceeds threshold ({reservation_utility:.2f}). {negotiation_message}"
-        else:
-            if t > self.financial_runway:
-                # Financial pressure - lower standards
-                desperation_factor = 0.8
-                adjusted_threshold = reservation_utility * desperation_factor
-                
-                if negotiated_utility >= adjusted_threshold:
-                    return True, f"Accept under financial pressure: Utility ({negotiated_utility:.2f}) exceeds adjusted threshold ({adjusted_threshold:.2f}). {negotiation_message}"
+        # Calculate a small rejection cost (around 0.5% of the threshold)
+        # This is a small cost for turning down an offer
+        rejection_cost = 0.005 * threshold * (1 + 0.05 * self.rejections_made)
+        
+        # Decision details for transparency
+        decision_details = {
+            "offer_utility": utility,
+            "threshold": threshold,
+            "market_condition": market_condition,
+            "time_factor": self._get_time_factor(t),
+            "runway_factor": self._get_runway_factor(t),
+            "rejection_cost": rejection_cost,
+            "financial_runway_remaining": max(0, self.financial_runway - t),
+            "employment_status": self.employment_status
+        }
+        
+        # BASIC DECISION: If utility exceeds threshold, accept
+        if utility >= threshold:
+            return True, f"Accept: Utility ({utility:.2f}) exceeds threshold ({threshold:.2f})", decision_details
+        
+        # Calculate adjusted threshold with a reasonable rejection cost
+        adjusted_threshold = threshold - rejection_cost
+        
+        # # Debug output for decision making
+        # print("\nDECISION CALCULATION:")
+        # print(f"  Offer utility: {utility:.2f}")
+        # print(f"  Base threshold: {threshold:.2f}")
+        # print(f"  Rejection cost: {rejection_cost:.2f}")
+        # print(f"  Adjusted threshold: {adjusted_threshold:.2f}")
+        
+        # ADJUSTED DECISION: If utility exceeds adjusted threshold (considering rejection cost)
+        if utility >= adjusted_threshold:
+            return True, f"Accept considering rejection costs: Utility ({utility:.2f}) exceeds adjusted threshold ({adjusted_threshold:.2f})", decision_details
+        
+        # FINANCIAL PRESSURE: If past financial runway, lower standards
+        if t > self.financial_runway:
+            # Desperation factor depends on employment status
+            desperation_factor = 0.6 if self.employment_status == 'unemployed' else 0.8
+            financial_pressure_threshold = threshold * desperation_factor
             
-            return False, f"Reject: Utility ({negotiated_utility:.2f}) below threshold ({reservation_utility:.2f}). {negotiation_message}"
-    
-    def observe_offer(self, offer: JobOffer, t: float, interview_successful: bool = None):
-        """
-        Observe a new job offer and update our models.
+            print(f"  Financial pressure threshold: {financial_pressure_threshold:.2f}")
+            
+            if utility >= financial_pressure_threshold:
+                return True, f"Accept under financial pressure: Utility ({utility:.2f}) exceeds adjusted threshold ({financial_pressure_threshold:.2f})", decision_details
         
-        Args:
-            offer: The observed job offer
-            t: Time when the offer was observed
-            interview_successful: Whether the interview was successful (if known)
-        """
-        # Update our current time
+        # RANDOM ELEMENT: Occasionally accept suboptimal offers (irrational decision)
+        emotional_factor = random.random()
+        if utility > threshold * 0.8 and emotional_factor < 0.05:  # 5% chance if within 80% of threshold
+            return True, f"Accept (unusual): Utility ({utility:.2f}) below threshold ({threshold:.2f}) but accepted due to intangible factors", decision_details
+        
+        # Default: REJECT
+        return False, f"Reject: Utility ({utility:.2f}) below threshold ({threshold:.2f})", decision_details
+    
+    def observe_offer(self, offer: Dict[str, Any], t: float, was_accepted: bool = None):
+        """Observe a new job offer and update models with semantic understanding."""
+        # Update current time
         self.current_time = t
         
         # Store the offer
         self.observed_offers.append((offer, t))
         
-        # Update our job market model
-        self.job_market.update_with_offer(offer, t, interview_successful)
+        # Calculate offer utility
+        utility = self.calculate_offer_utility(offer)
         
-        # Track best offer so far
-        utility = offer.calculate_utility(self.preferences)
+        # Update best offer if this is better
         if utility > self.best_utility_so_far:
             self.best_offer_so_far = offer
             self.best_utility_so_far = utility
         
-        # Recalculate our value function with updated information
+        # Update enhanced Bayesian belief model
+        self.belief_model.update_with_offer(offer, was_accepted)
+        
+        # Track rejection and update fatigue
+        if was_accepted is False:
+            self.rejections_made += 1
+            # Fatigue increase depends on field
+            field = self.user_profile.get('field', 'general')
+            if field in ['high_stress', 'interview_intensive']:
+                # More fatigue in demanding fields
+                self.fatigue_factor += 0.15
+            else:
+                self.fatigue_factor += 0.1
+        
+        # Increase fatigue for every offer
+        self.fatigue_factor += 0.02
+        
+        # Recalculate value function with updated info
         self._initialize_value_function()
     
-    def plot_strategy(self):
-        """Plot the job search strategy and offers."""
-        plt.figure(figsize=(12, 8))
+    def get_search_insights(self) -> Dict[str, Any]:
+        """Get insights about the job search with semantic understanding."""
+        # Current time point
+        t = self.current_time
         
-        # Plot reservation utility curve
-        plt.plot(self.time_grid, self.reservation_utilities, 'b-', label='Reservation Utility')
+        # Market insights with semantic understanding
+        market_condition = self.belief_model.get_market_condition(t)
         
-        # Plot value function
-        plt.plot(self.time_grid, self.value_function, 'g--', label='Value of Continuing Search')
+        # Salary expectations with field context
+        salary_range = self.belief_model.get_expected_salary_range()
+        field = self.user_profile.get('field', 'general')
+        experience = self.user_profile.get('experience_level', 'mid')
         
-        # Plot financial runway
-        plt.axvline(x=self.financial_runway, color='r', linestyle='--', 
-                   label=f'Financial Runway ({self.financial_runway:.2f} {self.time_units})')
+        # Adjust salary range display based on location
+        location = self.user_profile.get('location', 'other')
+        location_factor = self.belief_model.context["location"]["cost_modifier"]
+        adjusted_range = (salary_range[0] * location_factor, salary_range[1] * location_factor)
         
-        # Plot observed offers
-        if self.observed_offers:
-            offer_times = [t for _, t in self.observed_offers]
-            offer_utilities = [o.calculate_utility(self.preferences) for o, _ in self.observed_offers]
-            plt.scatter(offer_times, offer_utilities, color='orange', s=50, label='Observed Offers')
-            
-            # Highlight best offer
-            if self.best_offer_so_far:
-                best_utility = self.best_utility_so_far
-                idx = offer_utilities.index(best_utility)
-                plt.scatter([offer_times[idx]], [best_utility], color='green', s=100, 
-                           label=f'Best Offer: {self.best_offer_so_far.company}')
+        # Top attributes with semantic meaning
+        top_attributes = {}
+        for attr_name in self.belief_model.attribute_models:
+            var_type = VARIABLE_TYPES.get(attr_name)
+            if not var_type:
+                continue
+                
+            # Skip attributes not applicable to this field
+            if attr_name in self.belief_model.context["field"] and \
+               "applicable" in self.belief_model.context["field"][attr_name] and \
+               not self.belief_model.context["field"][attr_name]["applicable"]:
+                continue
+                
+            expected_value = self.belief_model.get_attribute_expectation(attr_name)
+            top_attributes[attr_name] = expected_value
         
-        # Add seasonality effect on secondary axis
-        ax1 = plt.gca()
-        ax2 = ax1.twinx()
+        # Sort and get top 3
+        top_attributes = dict(sorted(top_attributes.items(), key=lambda x: x[1], reverse=True)[:3])
         
-        # Convert seasonality to continuous function
-        season_t = np.linspace(0, 1, 16)
-        season_values = self.job_market.seasonality_factors
-        season_interp = np.interp(np.linspace(0, 1, 100), season_t, season_values)
-        
-        # Repeat the seasonality for the full time scale
-        repeated_seasons = np.tile(season_interp, int(np.ceil(self.max_time)))[:len(self.time_grid)]
-        ax2.plot(self.time_grid, repeated_seasons, 'k:', alpha=0.5, label='Market Seasonality')
-        ax2.set_ylabel('Market Condition Factor')
-        ax2.set_ylim(0.8, 1.2)
-        
-        # Legends and labels
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
-        
-        plt.title('Continuous-Time Optimal Stopping Strategy for Job Search')
-        plt.xlabel(f'Time ({self.time_units})')
-        plt.ylabel('Utility')
-        plt.grid(True, alpha=0.3)
-        
-        return plt
-    
-    def get_strategy_summary(self) -> Dict:
-        """Generate a summary of the search strategy."""
-        # Divide the time horizon into phases
-        early_phase = self.time_grid[self.time_grid < 0.33 * self.max_time]
-        mid_phase = self.time_grid[(self.time_grid >= 0.33 * self.max_time) & 
-                                  (self.time_grid < 0.67 * self.max_time)]
-        late_phase = self.time_grid[self.time_grid >= 0.67 * self.max_time]
-        
-        # Get corresponding utilities
-        early_utils = [self.get_reservation_utility(t) for t in early_phase]
-        mid_utils = [self.get_reservation_utility(t) for t in mid_phase]
-        late_utils = [self.get_reservation_utility(t) for t in late_phase]
-        
-        # Analyze
-        early_avg = np.mean(early_utils) if early_utils else 0
-        mid_avg = np.mean(mid_utils) if mid_utils else 0
-        late_avg = np.mean(late_utils) if late_utils else 0
-        
-        utility_decline_rate = (early_avg - late_avg) / self.max_time if self.max_time > 0 else 0
-        
-        # Create runway milestones
-        runway_reached_time = min(self.financial_runway, self.max_time)
-        runway_threshold = self.get_reservation_utility(runway_reached_time)
+        # Expected time with field-specific considerations
+        expected_time = self._estimate_time_to_acceptable_offer()
         
         return {
+            "current_time": t,
+            "market_condition": market_condition,
+            "expected_salary_range": adjusted_range,
+            "top_attributes": top_attributes,
+            "field_context": field,
+            "experience_level": experience,
+            "offers_observed": len(self.observed_offers),
+            "rejections_made": self.rejections_made,
+            "current_threshold": self.get_reservation_utility(t),
             "initial_threshold": self.reservation_utilities[0],
-            "final_threshold": self.reservation_utilities[-1],
-            "early_phase_avg_threshold": early_avg,
-            "mid_phase_avg_threshold": mid_avg,
-            "late_phase_avg_threshold": late_avg,
-            "threshold_decline_rate": utility_decline_rate,
-            "financial_runway_time": self.financial_runway,
-            "financial_runway_threshold": runway_threshold,
-            "best_utility_so_far": self.best_utility_so_far if self.best_utility_so_far > -float('inf') else None,
-            "market_condition": self.job_market.market_condition,
-            "candidate_desirability": self.job_market.negotiation_model['candidate_desirability'],
+            "estimated_time_remaining": expected_time,
+            "financial_runway_remaining": max(0, self.financial_runway - t)
         }
+    
+    def _estimate_time_to_acceptable_offer(self) -> float:
+        """Estimate time to acceptable offer with semantic understanding."""
+        # Current time and threshold
+        t = self.current_time
+        threshold = self.get_reservation_utility(t)
+        
+        # Generate sample offers with field-specific models
+        n_samples = 100
+        sample_offers = [self.belief_model.generate_job_offer(t) for _ in range(n_samples)]
+        sample_utilities = [self.preference_processor.calculate_offer_utility(offer) for offer in sample_offers]
+        
+        # Estimate probability of acceptable offer
+        p_acceptable = sum(1 for u in sample_utilities if u >= threshold) / n_samples
+        
+        # Safety check
+        if p_acceptable <= 0.01:  # Very low chance
+            return self.max_time - t  # Pessimistic estimate
+            
+        # Get field-specific arrival rate
+        field = self.user_profile.get('field', 'general')
+        field_arrival_factor = 1.0
+        
+        if field == 'software_engineering':
+            field_arrival_factor = 1.2  # More opportunities
+        elif field == 'academic':
+            field_arrival_factor = 0.7  # Fewer opportunities
+            
+        # Expected time depends on field-specific arrival rate
+        expected_offers_needed = 1 / p_acceptable
+        field_adjusted_arrival_rate = self.offer_arrival_rate * field_arrival_factor
+        expected_time = expected_offers_needed / field_adjusted_arrival_rate
+        
+        # Cap at remaining time
+        return min(expected_time, self.max_time - t)
 
+# ===========================================================================
+# 6. EXAMPLE USER PROFILES FOR TESTING
+# ===========================================================================
 
-class AdvancedJobSearchOptimizer:
-    """
-    Advanced job search optimizer that integrates continuous-time OST with
-    Bayesian updating and strategic interactions.
-    """
+def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create a software engineer profile for testing."""
+    user_profile = {
+        "field": "software_engineering",
+        "experience_level": "mid",
+        "location": "san_francisco",
+        "employment_status": "employed",
+        "deal_breakers": ["excessive_travel", "on_call_rotation"],
+        "would_accept_lower_salary_for": ["remote_work", "work_life_balance"]
+    }
     
-    def __init__(self, preferences: dict, max_time: float = 1.0, time_units: str = "years"):
-        """
-        Initialize the advanced job search optimizer.
-        
-        Args:
-            preferences: User preferences dictionary
-            max_time: Maximum time for job search
-            time_units: Units for time (for display)
-        """
-        self.preferences = preferences
-        self.max_time = max_time
-        self.time_units = time_units
-        
-        # Create the OST model
-        self.ost = ContinuousTimeOST(preferences, max_time, time_units)
-        
-        # Tracking variables
-        self.current_time = 0.0
-        self.accepted_offer = None
-        self.accepted_time = None
-        self.search_history = []
-        
-        # Decision variables
-        self.application_strategy = {
-            'time_per_application': 0.01,  # Time units spent per application
-            'max_concurrent': 5,  # Maximum number of concurrent applications
-            'success_probability': 0.3,  # Base probability of successful application
-        }
-        
-        # Active applications
-        self.active_applications = []  # [{company, start_time, progress, ...}]
-        
-        # For access in methods
-        self.time_grid = self.ost.time_grid
-        self.value_function = self.ost.value_function
+    # MODIFICATION 2: Increase financial runway and risk tolerance
+    user_preferences = {
+        "current_salary": 120000,
+        "min_salary": 110000,
+        "financial_runway": 12,  # 12 months instead of 6
+        "risk_tolerance": 9,     # Higher risk tolerance (was 7)
+        "job_search_urgency": 5,  # 1-10 scale
+        "compensation_weight": 4,
+        "career_growth_weight": 5,
+        "work_life_balance_weight": 4,
+        "company_reputation_weight": 3,
+        "remote_work_weight": 4,
+        "tech_stack_alignment_weight": 5,
+        "team_collaboration_weight": 4,
+        "role_responsibilities_weight": 3
+    }
     
-    def strategic_search_step(self, time_step: float = 0.05):
-        """
-        Execute a strategic job search step, including:
-        1. Processing active applications
-        2. Starting new applications
-        3. Evaluating offers
-        4. Updating search strategy
-        
-        Args:
-            time_step: Amount of time to simulate in this step
-            
-        Returns:
-            Dictionary with information about this step
-        """
-        start_time = self.current_time
-        end_time = min(self.max_time, start_time + time_step)
-        self.current_time = end_time
-        
-        # Dictionary to store information about this step
-        step_info = {
-            'start_time': start_time,
-            'end_time': end_time,
-            'time_step': time_step,
-            'offers_received': [],
-            'applications_started': [],
-            'applications_rejected': [],
-            'applications_completed': [],
-            'negotiation_attempts': [],
-            'decisions': [],
-            'strategy_updates': [],
-            'reservation_utility': self.ost.get_reservation_utility(start_time),
-        }
-        
-        # 1. Process existing applications
-        self._process_applications(time_step, step_info)
-        
-        # 2. Generate new applications if capacity allows
-        if len(self.active_applications) < self.application_strategy['max_concurrent']:
-            self._generate_applications(time_step, step_info)
-        
-        # 3. Update search strategy based on new information
-        self._update_search_strategy(step_info)
-        
-        # Add to search history
-        self.search_history.append(step_info)
-        
-        return step_info
+    return user_profile, user_preferences
+
+def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create a marketing professional profile for testing."""
+    user_profile = {
+        "field": "marketing",
+        "experience_level": "senior",
+        "location": "new_york",
+        "employment_status": "unemployed",
+        "deal_breakers": ["toxic_culture"],
+        "would_accept_lower_salary_for": ["career_growth", "company_reputation"]
+    }
     
-    def _process_applications(self, time_step: float, step_info: Dict):
-        """Process active applications, advancing them or generating offers."""
-        still_active = []
-        
-        for app in self.active_applications:
-            # Advance progress
-            app['progress'] += time_step / self.application_strategy['time_per_application']
-            
-            # Check for completion or rejection
-            if app['progress'] >= 1.0:
-                # Application process complete - determine if successful
-                success_prob = app['base_success_prob'] * self.ost.job_market.negotiation_model['candidate_desirability']
-                
-                # Apply market condition factor to success probability
-                market_factor = self.ost.job_market.market_condition
-                adjusted_success_prob = success_prob * market_factor
-                
-                # Generate a detailed reason for success/failure
-                company_tier = "top" if app['offer_model'].company_reputation >= 4 else \
-                              "good" if app['offer_model'].company_reputation >= 3 else \
-                              "average" if app['offer_model'].company_reputation >= 2 else "below_average"
-                
-                tech_match = app['offer_model'].tech_stack_match
-                
-                # Random failure scenarios for rejections
-                failure_scenarios = [
-                    f"Not enough experience for the {company_tier}-tier company",
-                    f"Another candidate was a better fit for {app['company']}'s needs",
-                    f"Limited technical match (your tech stack match was {tech_match}/5)",
-                    f"Cultural fit concerns after the final interview round",
-                    f"Position was filled internally or put on hold",
-                    f"Budgetary constraints led to a hiring freeze",
-                    f"Organizational restructuring affected the hiring process"
-                ]
-                
-                success_scenarios = [
-                    f"Strong interview performance impressed the hiring team",
-                    f"Your background aligned well with {app['company']}'s needs",
-                    f"Your tech stack expertise was highly valued (match: {tech_match}/5)",
-                    f"Good rapport with the hiring manager during interviews",
-                    f"Company is actively expanding and needs to fill positions quickly"
-                ]
-                
-                # Determine outcome first
-                is_success = np.random.random() < adjusted_success_prob
-                
-                # Select reason based on outcome
-                if is_success:
-                    reason = random.choice(success_scenarios)
-                else:
-                    reason = random.choice(failure_scenarios)
-                
-                if is_success:
-                    # Success - generate a job offer
-                    offer = self.ost.job_market.generate_job_offer(self.current_time)
-                    
-                    # Use the company name from the application
-                    offer.company = app['company']
-                    
-                    # Record the offer with detailed attributes
-                    step_info['offers_received'].append({
-                        'company': offer.company,
-                        'salary': offer.salary,
-                        'attributes': {
-                            'career_growth': offer.career_growth,
-                            'work_life_balance': offer.work_life_balance,
-                            'company_reputation': offer.company_reputation,
-                            'role_responsibilities': offer.role_responsibilities,
-                            'ai_component': offer.ai_component,
-                            'tech_stack_match': offer.tech_stack_match,
-                            'mentoring_opportunity': offer.mentoring_opportunity,
-                            'project_variety': offer.project_variety,
-                            'team_collaboration': offer.team_collaboration
-                        },
-                        'negotiation_flexibility': offer.negotiation_flexibility,
-                        'success_reason': reason
-                    })
-                    
-                    # Update our OST model with this offer
-                    self.ost.observe_offer(offer, self.current_time, True)
-                    
-                    # Decide whether to accept
-                    should_accept, explanation = self.ost.should_accept_offer(offer, self.current_time)
-                    
-                    # Record decision with detailed explanation
-                    decision_info = {
-                        'offer': offer.company,
-                        'salary': offer.salary,
-                        'utility': offer.calculate_utility(self.preferences),
-                        'threshold': self.ost.get_reservation_utility(self.current_time),
-                        'decision': 'accept' if should_accept else 'reject',
-                        'explanation': explanation,
-                        'offer_details': {
-                            'career_growth': offer.career_growth,
-                            'work_life_balance': offer.work_life_balance,
-                            'company_reputation': offer.company_reputation,
-                            'role_responsibilities': offer.role_responsibilities,
-                            'ai_component': offer.ai_component,
-                            'tech_stack_match': offer.tech_stack_match
-                        }
-                    }
-                    
-                    # Add specific reasons for rejection if applicable
-                    if not should_accept:
-                        low_attributes = []
-                        for attr, value in decision_info['offer_details'].items():
-                            weight_key = f"{attr}_weight" if attr != "ai_component" else "ai_application_interest"
-                            weight = self.preferences.get(weight_key, 3)
-                            if weight >= 4 and value <= 2:  # High importance but low score
-                                low_attributes.append(f"{attr.replace('_', ' ')} is only {value}/5 but importance is {weight}/5")
-                        
-                        if low_attributes:
-                            decision_info['low_attributes'] = low_attributes
-                    
-                    step_info['decisions'].append(decision_info)
-                    
-                    # If accepting, end the search
-                    if should_accept:
-                        self.accepted_offer = offer
-                        self.accepted_time = self.current_time
-                else:
-                    # Rejection
-                    step_info['applications_rejected'].append({
-                        'company': app['company'],
-                        'time_invested': app['progress'] * self.application_strategy['time_per_application'],
-                        'reason': reason,
-                        'market_factor': market_factor
-                    })
-                    
-                    # Update our OST model with this rejection
-                    self.ost.job_market.update_with_offer(app['offer_model'], self.current_time, False)
-                
-                # Record completion with detailed information
-                outcome = 'offer' if is_success else 'rejection'
-                completion_info = {
-                    'company': app['company'],
-                    'outcome': outcome,
-                    'time_invested': app['progress'] * self.application_strategy['time_per_application'],
-                    'company_tier': company_tier,
-                    'tech_match': tech_match,
-                    'success_probability': f"{adjusted_success_prob:.1%}",
-                    'reason': reason
-                }
-                    
-                step_info['applications_completed'].append(completion_info)
-            else:
-                # Application still in progress
-                still_active.append(app)
-        
-        # Update active applications
-        self.active_applications = still_active
+    # MODIFICATION 2: Increase financial runway and risk tolerance
+    user_preferences = {
+        "current_salary": 95000,
+        "min_salary": 85000,
+        "financial_runway": 12,  # 12 months instead of 3
+        "risk_tolerance": 9,     # Higher risk tolerance (was 4)
+        "job_search_urgency": 8,  # 1-10 scale
+        "compensation_weight": 4,
+        "career_growth_weight": 5,
+        "work_life_balance_weight": 3,
+        "company_reputation_weight": 5,
+        "remote_work_weight": 2,
+        "role_responsibilities_weight": 4
+    }
     
-    def _generate_applications(self, time_step: float, step_info: Dict):
-        """Generate new job applications based on current strategy."""
-        # Calculate number of new applications to start
-        capacity = self.application_strategy['max_concurrent'] - len(self.active_applications)
-        
-        # Limit by how many we can realistically start in this time step
-        max_new = int(time_step / (self.application_strategy['time_per_application'] * 0.2))
-        num_new = min(capacity, max_new)
-        
-        # Generate applications
-        for _ in range(num_new):
-            # Create a model of what the offer might look like
-            offer_model = self.ost.job_market.generate_job_offer(self.current_time)
-            
-            # Adjust success probability based on company tier and candidate desirability
-            base_success_prob = self.application_strategy['success_probability']
-            
-            # Success probability increases with worse company reputation
-            # (easier to get offers from less prestigious companies)
-            company_factor = 1.0 + (0.1 * (6 - offer_model.company_reputation))
-            base_success_prob *= company_factor
-            
-            # Create application
-            app = {
-                'company': offer_model.company,
-                'start_time': self.current_time,
-                'progress': 0.0,
-                'offer_model': offer_model,
-                'base_success_prob': base_success_prob,
-            }
-            
-            self.active_applications.append(app)
-            
-            # Record in step info
-            step_info['applications_started'].append({
-                'company': app['company'],
-                'estimated_salary': offer_model.salary,
-                'estimated_career_growth': offer_model.career_growth,
-            })
+    return user_profile, user_preferences
+
+# ===========================================================================
+# 7. SIMULATION DEMO
+# ===========================================================================
+
+def run_semantic_ost_simulation():
+    """Run a simulation of the semantic OST algorithm."""
+    print("=== SEMANTIC OPTIMAL STOPPING THEORY SIMULATION ===\n")
     
-    def _update_search_strategy(self, step_info: Dict):
-        """Update search strategy based on evolving market model."""
-        # Get current market condition
-        market_condition = self.ost.job_market.market_condition
-        
-        # Adjust max concurrent applications based on market conditions
-        if market_condition < 0.9:
-            # Poor market - apply to more places
-            new_max = min(8, self.application_strategy['max_concurrent'] + 1)
-            if new_max != self.application_strategy['max_concurrent']:
-                self.application_strategy['max_concurrent'] = new_max
-                step_info['strategy_updates'].append({
-                    'parameter': 'max_concurrent_applications',
-                    'old_value': new_max - 1,
-                    'new_value': new_max,
-                    'reason': 'Poor market conditions - increasing application volume'
-                })
-        elif market_condition > 1.1 and self.application_strategy['max_concurrent'] > 3:
-            # Good market - be more selective
-            new_max = self.application_strategy['max_concurrent'] - 1
-            self.application_strategy['max_concurrent'] = new_max
-            step_info['strategy_updates'].append({
-                'parameter': 'max_concurrent_applications',
-                'old_value': new_max + 1,
-                'new_value': new_max,
-                'reason': 'Strong market conditions - focusing on quality over quantity'
-            })
-        
-        # Adjust time per application as search progresses
-        runway_remaining = max(0, self.ost.financial_runway - self.current_time)
-        if runway_remaining < 0.2 and self.application_strategy['time_per_application'] > 0.005:
-            # Running out of runway - spend less time per application
-            old_value = self.application_strategy['time_per_application']
-            new_value = max(0.005, old_value * 0.9)
-            self.application_strategy['time_per_application'] = new_value
-            
-            step_info['strategy_updates'].append({
-                'parameter': 'time_per_application',
-                'old_value': old_value,
-                'new_value': new_value,
-                'reason': 'Financial pressure increasing - accelerating application process'
-            })
+    # Choose a profile
+    profile_choice = random.choice(["swe", "marketing"])
     
-    def run_full_search(self, verbose=True) -> Dict:
-        """
-        Run the full job search until an offer is accepted or time runs out.
+    if profile_choice == "swe":
+        user_profile, user_preferences = create_swe_profile()
+        print("Using Software Engineer profile")
+    else:
+        user_profile, user_preferences = create_marketing_profile()
+        print("Using Marketing Professional profile")
+    
+    print("\nUser profile:")
+    for key, value in sorted(user_profile.items()):
+        print(f"  {key}: {value}")
+    
+    print("\nUser preferences:")
+    for key, value in sorted(user_preferences.items()):
+        print(f"  {key}: {value}")
+    
+    # Initialize Semantic OST
+    ost = SemanticOST(user_profile, user_preferences, max_time=1.0, time_units="years")
+    
+    print("\nOST Model initialized with contextual parameters:")
+    print(f"  Field: {user_profile['field']}")
+    print(f"  Experience: {user_profile['experience_level']}")
+    print(f"  Location: {user_profile['location']}")
+    print(f"  Employment status: {user_profile['employment_status']}")
+    print(f"  Financial runway: {ost.financial_runway:.2f} years")
+    print(f"  Expected salary: ${ost.belief_model.context['expected_salary']:,.2f}")
+    print(f"  Initial reservation utility: {ost.reservation_utilities[0]:.2f}")
+    
+    # Simulate offer evaluation
+    print("\nPROCESSING OFFERS WITH SEMANTIC UNDERSTANDING...")
+    
+    # MODIFICATION 15: Generate more offers and ensure they're spread out over time
+    num_offers = random.randint(8, 12)  # More offers to test with
+    accepted = False
+    
+    for i in range(num_offers):
+        # Distribute offers throughout the search period, with exact timing based on offer number
+        t = i / num_offers  # Ensures even distribution from 0 to almost 1.0
+        t += random.random() * 0.05  # Add slight randomness but keep sequential
+        t = min(t, 0.99)  # Cap at 0.99 to stay within max_time
         
-        Args:
-            verbose: Whether to print detailed information during the search
+        print(f"\n--- TIME: {t:.2f} YEARS ---")
+        
+        # Generate an offer with semantic understanding
+        offer = ost.belief_model.generate_job_offer(t)
+        
+        # Print offer details with semantic context
+        print(f"Received offer from {offer['company']} for {offer['position']}")
+        print(f"Base Salary: ${offer['base_salary']:,.2f}")
+        print("Key attributes:")
+        
+        # Print top attributes (excluding monetary)
+        top_attrs = sorted(
+            [(k, v) for k, v in offer.items() 
+             if k in VARIABLE_TYPES and 
+             VARIABLE_TYPES[k].var_type not in ["monetary"] and
+             isinstance(v, (int, float))],
+            key=lambda x: x[1], reverse=True
+        )[:4]
+        
+        for attr_name, value in top_attrs:
+            var_type = VARIABLE_TYPES.get(attr_name)
+            if var_type:
+                print(f"  {attr_name}: {value}/10 ({var_type.description})")
+        
+        # Check hard constraints first
+        meets_constraints, constraint_reason = ost.preference_processor.check_hard_constraints(offer)
+        if not meets_constraints:
+            print(f"\nDECISION: REJECT (Hard constraint violation)")
+            print(f"Reason: {constraint_reason}")
             
-        Returns:
-            Dictionary with search results
-        """
-        # Reset state
-        self.current_time = 0.0
-        self.accepted_offer = None
-        self.accepted_time = None
-        self.search_history = []
-        self.active_applications = []
+            # Update model with rejection
+            ost.observe_offer(offer, t, False)
+            continue
         
-        if verbose:
-            print("\n===== BEGINNING JOB SEARCH SIMULATION =====")
-            print(f"Financial runway: {self.ost.financial_runway:.2f} {self.time_units}")
-            print(f"Initial reservation utility: {self.ost.get_reservation_utility(0):.2f}")
-            print(f"Job search urgency: {self.ost.job_search_urgency:.2f} (0-1 scale)")
-            print(f"Risk tolerance: {self.ost.risk_tolerance:.2f} (0-1 scale)")
-            print("Starting search process...\n")
+        # Calculate utility with semantic understanding
+        utility = ost.calculate_offer_utility(offer)
+        print(f"\nCalculated utility: {utility:.2f}/10")
         
-        # Run search steps until we accept an offer or run out of time
-        step_counter = 0
-        while self.current_time < self.max_time and not self.accepted_offer:
-            step_counter += 1
-            step_info = self.strategic_search_step()
-            
-            if verbose:
-                self._print_step_details(step_counter, step_info)
-                
-                # Add pause every few steps when printing to make it easier to follow
-                if step_counter % 5 == 0:
-                    print(f"\n--- SEARCH PROGRESS: {self.current_time:.2f}/{self.max_time} {self.time_units} elapsed ---\n")
-        
-        # Compile results
-        results = {
-            'accepted_offer': None,
-            'search_duration': self.current_time,
-            'num_steps': len(self.search_history),
-            'applications_started': sum(len(step['applications_started']) for step in self.search_history),
-            'offers_received': sum(len(step['offers_received']) for step in self.search_history),
-            'rejections_received': sum(len(step['applications_rejected']) for step in self.search_history),
-            'financial_runway': self.ost.financial_runway,
-            'strategy_summary': self.ost.get_strategy_summary(),
-        }
-        
-        if self.accepted_offer:
-            results['accepted_offer'] = {
-                'company': self.accepted_offer.company,
-                'salary': self.accepted_offer.salary,
-                'career_growth': self.accepted_offer.career_growth,
-                'work_life_balance': self.accepted_offer.work_life_balance,
-                'company_reputation': self.accepted_offer.company_reputation,
-                'role_responsibilities': self.accepted_offer.role_responsibilities,
-                'utility': self.accepted_offer.calculate_utility(self.preferences),
-                'time_accepted': self.accepted_time,
-            }
-            
-            # Check if accepted within financial runway
-            results['accepted_within_runway'] = self.accepted_time <= self.ost.financial_runway
-            
-            if verbose:
-                print("\n===== OFFER ACCEPTED =====")
-                print(f"Company: {self.accepted_offer.company}")
-                print(f"Salary: £{self.accepted_offer.salary:,.2f}")
-                print(f"Career Growth: {self.accepted_offer.career_growth}/5")
-                print(f"Work-Life Balance: {self.accepted_offer.work_life_balance}/5")
-                print(f"Company Reputation: {self.accepted_offer.company_reputation}/5")
-                print(f"Role Responsibilities: {self.accepted_offer.role_responsibilities}/5")
-                print(f"AI Component: {self.accepted_offer.ai_component}/5")
-                print(f"Tech Stack Match: {self.accepted_offer.tech_stack_match}/5")
-                print(f"Mentoring Opportunity: {self.accepted_offer.mentoring_opportunity}/5")
-                print(f"Project Variety: {self.accepted_offer.project_variety}/5")
-                print(f"Team Collaboration: {self.accepted_offer.team_collaboration}/5")
-                print(f"Utility: {self.accepted_offer.calculate_utility(self.preferences):.2f}")
-                print(f"Accepted at: {self.accepted_time:.2f} {self.time_units}")
-                if results['accepted_within_runway']:
-                    print(f"Accepted within financial runway of {self.ost.financial_runway:.2f} {self.time_units}")
-                else:
-                    time_past_runway = self.accepted_time - self.ost.financial_runway
-                    print(f"Accepted {time_past_runway:.2f} {self.time_units} AFTER financial runway was depleted")
-        else:
-            if verbose:
-                print("\n===== SEARCH COMPLETED WITHOUT ACCEPTING ANY OFFER =====")
-                print(f"Searched for the entire {self.max_time} {self.time_units} without finding an acceptable offer")
-                print(f"Total applications submitted: {results['applications_started']}")
-                print(f"Total offers received: {results['offers_received']}")
-                print(f"Total rejections received: {results['rejections_received']}")
-                
-                # Report on best offer seen
-                if self.ost.best_offer_so_far:
-                    best = self.ost.best_offer_so_far
-                    print("\nBest offer encountered during search:")
-                    print(f"Company: {best.company}")
-                    print(f"Salary: £{best.salary:,.2f}")
-                    print(f"Utility: {self.ost.best_utility_so_far:.2f}")
-                    print(f"This offer was below your reservation utility threshold when received")
-        
-        if verbose:
-            self._print_search_summary(results)
-        
-        return results
-        
-    def _print_step_details(self, step_number, step_info):
-        """Print detailed information about a search step."""
-        time_point = step_info['end_time']
-        
-        print(f"STEP {step_number} - Time: {time_point:.2f} {self.time_units}")
-        
-        # Print financial status
-        runway_remaining = self.ost.financial_runway - time_point
-        if runway_remaining > 0:
-            print(f"Financial runway: {runway_remaining:.2f} {self.time_units} remaining")
-        else:
-            print(f"Financial runway: DEPLETED (exceeded by {abs(runway_remaining):.2f} {self.time_units})")
-        
-        # Print current threshold
-        current_threshold = step_info['reservation_utility']
-        print(f"Current reservation utility threshold: {current_threshold:.2f}")
-        
-        # Print market condition
-        print(f"Current market condition factor: {self.ost.job_market.market_condition:.2f}")
-        
-        # Print new applications
-        if step_info['applications_started']:
-            print("\nNew applications started:")
-            for i, app in enumerate(step_info['applications_started']):
-                print(f"  {i+1}. {app['company']} - Est. salary: £{app['estimated_salary']:,.2f}, " +
-                      f"Est. career growth: {app['estimated_career_growth']}/5")
-        else:
-            print("\nNo new applications started this period")
-        
-        # Print application rejections
-        if step_info['applications_rejected']:
-            print("\nApplications rejected:")
-            for i, rej in enumerate(step_info['applications_rejected']):
-                print(f"  {i+1}. {rej['company']} - Time invested: {rej['time_invested']:.2f} {self.time_units}")
-                print(f"     REASON: Failed during interview/assessment process")
-        
-        # Print offers received
-        if step_info['offers_received']:
-            print("\nOffers received:")
-            for i, offer in enumerate(step_info['offers_received']):
-                print(f"  {i+1}. {offer['company']} - Salary: £{offer['salary']:,.2f}")
-                print(f"     Key attributes: Career Growth: {offer['attributes']['career_growth']}/5, " +
-                      f"Work-Life Balance: {offer['attributes']['work_life_balance']}/5, " +
-                      f"Company Reputation: {offer['attributes']['company_reputation']}/5")
-                print(f"     Negotiation flexibility: {offer['negotiation_flexibility']:.2f}")
+        # Make decision with semantic understanding
+        should_accept, reason, details = ost.should_accept_offer(offer, t)
         
         # Print decision details
-        if step_info['decisions']:
-            print("\nDecisions made:")
-            for i, decision in enumerate(step_info['decisions']):
-                print(f"  {i+1}. {decision['offer']} - Salary: £{decision['salary']:,.2f}")
-                print(f"     Utility: {decision['utility']:.2f} vs Threshold: {decision['threshold']:.2f}")
-                print(f"     DECISION: {decision['decision'].upper()}")
-                print(f"     REASON: {decision['explanation']}")
+        print(f"Current threshold: {details['threshold']:.2f}")
+        print(f"Current market condition: {details['market_condition']:.2f}")
         
-        # Print strategy updates
-        if step_info['strategy_updates']:
-            print("\nStrategy updates:")
-            for i, update in enumerate(step_info['strategy_updates']):
-                print(f"  {i+1}. {update['parameter']}: {update['old_value']} → {update['new_value']}")
-                print(f"     REASON: {update['reason']}")
+        # Add field-specific context to the decision
+        field_context = ""
+        if user_profile['field'] == 'software_engineering':
+            if offer.get('tech_stack_alignment', 0) > 7:
+                field_context = " (Strong tech stack alignment is a positive factor)"
+            elif 'remote_work' in offer and offer['remote_work'] > 7:
+                field_context = " (Good remote work options are valued in tech)"
+        elif user_profile['field'] == 'marketing':
+            if offer.get('company_reputation', 0) > 7:
+                field_context = " (Strong company reputation is highly valued in marketing)"
         
-        # Print current active applications
-        active_count = len(self.active_applications)
-        if active_count > 0:
-            print(f"\nCurrently tracking {active_count} active applications")
-            for i, app in enumerate(self.active_applications):
-                progress_pct = app['progress'] * 100
-                print(f"  {i+1}. {app['company']} - Progress: {progress_pct:.1f}%")
+        print(f"DECISION: {'ACCEPT' if should_accept else 'REJECT'}{field_context}")
+        print(f"Reason: {reason}")
         
-        print("\n" + "-" * 80 + "\n")
-    
-    def _print_search_summary(self, results):
-        """Print a summary of the entire search process."""
-        print("\n===== SEARCH SUMMARY =====")
-        print(f"Search duration: {results['search_duration']:.2f} {self.time_units}")
-        print(f"Search steps: {results['num_steps']}")
-        print(f"Applications submitted: {results['applications_started']}")
-        print(f"Offers received: {results['offers_received']}")
-        print(f"Rejections received: {results['rejections_received']}")
+        # End search if accepted
+        if should_accept:
+            print("\n=== OFFER ACCEPTED! SEARCH COMPLETE ===")
+            print(f"Accepted offer from {offer['company']} at time {t:.2f} years")
+            ost.observe_offer(offer, t, True)
+            accepted = True
+            accepted_offer = offer
+            break
         
-        # Performance analysis
-        success_rate = results['offers_received'] / max(1, results['applications_started']) * 100
-        print(f"Application success rate: {success_rate:.1f}%")
+        # Update Bayesian model with rejection
+        ost.observe_offer(offer, t, False)
         
-        # Financial analysis
-        runway = self.ost.financial_runway
-        if results['search_duration'] <= runway:
-            print(f"Search completed with {runway - results['search_duration']:.2f} {self.time_units} of runway remaining")
+        # Get field-specific insights
+        insights = ost.get_search_insights()
+        
+        print("\nUpdated market insights with field context:")
+        print(f"  Market condition: {insights['market_condition']:.2f}")
+        print(f"  Expected salary range in {user_profile['location']}: ${insights['expected_salary_range'][0]:,.2f} - ${insights['expected_salary_range'][1]:,.2f}")
+        print(f"  Current threshold: {ost.get_reservation_utility(t):.2f} (initially {ost.reservation_utilities[0]:.2f})")
+        print(f"  Top attributes for {insights['field_context']} professionals:")
+        for attr, value in insights['top_attributes'].items():
+            var_type = VARIABLE_TYPES.get(attr)
+            if var_type:
+                print(f"    {attr}: {value:.1f}/10 ({var_type.description})")
+        
+        # Estimated time with field-specific context
+        if user_profile['field'] == 'software_engineering':
+            print(f"  Estimated time to acceptable offer: {insights['estimated_time_remaining']:.2f} years (Tech job market is typically more active)")
         else:
-            print(f"Search extended {results['search_duration'] - runway:.2f} {self.time_units} beyond financial runway")
+            print(f"  Estimated time to acceptable offer: {insights['estimated_time_remaining']:.2f} years")
+    
+    # Check if reached time horizon without accepting
+    if not accepted:
+        print("\n=== TIME HORIZON REACHED WITHOUT ACCEPTING ANY OFFER ===")
+        print(f"Searched for full {ost.max_time} {ost.time_units} without finding acceptable offer")
         
-        # Timeline statistics
-        timeline_buckets = 4
-        bucket_size = self.max_time / timeline_buckets
-        print("\nActivity distribution over time:")
-        
-        for i in range(timeline_buckets):
-            start_time = i * bucket_size
-            end_time = (i+1) * bucket_size
+        # Report best offer seen with semantic context
+        if ost.best_offer_so_far:
+            print("\nBest offer encountered:")
+            best = ost.best_offer_so_far
+            print(f"Company: {best['company']}")
+            print(f"Position: {best['position']}")
+            print(f"Salary: ${best['base_salary']:,.2f}")
+            print(f"Utility: {ost.best_utility_so_far:.2f}/10")
             
-            # Count activities in this time bucket
-            applications = sum(1 for step in self.search_history 
-                            if start_time <= step['end_time'] < end_time
-                            for _ in step['applications_started'])
-            
-            offers = sum(1 for step in self.search_history 
-                        if start_time <= step['end_time'] < end_time
-                        for _ in step['offers_received'])
-            
-            rejections = sum(1 for step in self.search_history 
-                          if start_time <= step['end_time'] < end_time
-                          for _ in step['applications_rejected'])
-            
-            print(f"  Period {i+1} ({start_time:.2f}-{end_time:.2f} {self.time_units}):")
-            print(f"    Applications: {applications}, Offers: {offers}, Rejections: {rejections}")
-        
-        # Threshold evolution
-        strategy = results['strategy_summary']
-        print("\nThreshold evolution:")
-        print(f"  Initial threshold: {strategy['initial_threshold']:.2f}")
-        print(f"  Early phase avg: {strategy['early_phase_avg_threshold']:.2f}")
-        print(f"  Mid phase avg: {strategy['mid_phase_avg_threshold']:.2f}")
-        print(f"  Late phase avg: {strategy['late_phase_avg_threshold']:.2f}")
-        print(f"  Final threshold: {strategy['final_threshold']:.2f}")
-        
-        # Runway threshold
-        print(f"  Threshold at financial runway: {strategy['financial_runway_threshold']:.2f}")
-        
-        # Market conditions
-        print(f"\nFinal market condition factor: {strategy['market_condition']:.2f}")
-        print(f"Final candidate desirability: {strategy['candidate_desirability']:.2f}")
-        
-        if results['accepted_offer']:
-            accepted = results['accepted_offer']
-            # Calculate how much utility was gained compared to:
-            # 1. Initial threshold
-            utility_gain_vs_initial = accepted['utility'] - strategy['initial_threshold']
-            # 2. Theoretical continuing value at time of acceptance
-            time_of_acceptance = accepted['time_accepted']
-            idx = min(len(self.time_grid) - 1, 
-                    int(time_of_acceptance / self.max_time * (len(self.time_grid) - 1)))
-            continuing_value = self.value_function[idx]
-            utility_gain_vs_continuing = accepted['utility'] - continuing_value
-            
-            print("\nOffer analysis:")
-            print(f"  Accepted utility vs initial threshold: {utility_gain_vs_initial:+.2f}")
-            print(f"  Accepted utility vs theoretical continuing value: {utility_gain_vs_continuing:+.2f}")
-            
-            if utility_gain_vs_continuing > 0:
-                print("  CONCLUSION: Made an optimal decision to accept this offer")
-            else:
-                print("  CONCLUSION: Theoretically could have gained more by continuing search")
-                print("              but practical constraints may justify the decision")
+            # Field-specific explanation
+            if user_profile['field'] == 'software_engineering':
+                if best.get('tech_stack_alignment', 0) < 5:
+                    print("This offer had poor tech stack alignment, which is highly valued in software engineering")
+                elif best.get('work_life_balance', 0) < 5 and user_preferences.get('work_life_balance_weight', 0) > 3:
+                    print("This offer had poor work-life balance, which you indicated was important")
+            elif user_profile['field'] == 'marketing':
+                if best.get('company_reputation', 0) < 5 and user_preferences.get('company_reputation_weight', 0) > 3:
+                    print("This offer had low company reputation, which is crucial in marketing roles")
     
-    def plot_search_trajectory(self):
-        """Plot the complete search trajectory, including offers and decisions."""
-        plt = self.ost.plot_strategy()
-        
-        # Add specific points where decisions were made
-        decision_times = []
-        decision_utilities = []
-        decision_outcomes = []
-        
-        for step in self.search_history:
-            for decision in step.get('decisions', []):
-                decision_times.append(step['end_time'])
-                decision_utilities.append(decision['utility'])
-                decision_outcomes.append(decision['decision'])
-        
-        # Plot accept/reject decisions
-        for i, outcome in enumerate(decision_outcomes):
-            color = 'green' if outcome == 'accept' else 'red'
-            marker = 'o' if outcome == 'accept' else 'x'
-            plt.scatter([decision_times[i]], [decision_utilities[i]], 
-                       color=color, marker=marker, s=100)
-        
-        # Highlight the accepted offer if any
-        if self.accepted_offer:
-            utility = self.accepted_offer.calculate_utility(self.preferences)
-            plt.scatter([self.accepted_time], [utility], color='lime', 
-                       marker='*', s=200, label='Accepted Offer')
-        
-        # Update title
-        if self.accepted_offer:
-            plt.suptitle(f'Job Search Trajectory - Offer Accepted after {self.accepted_time:.2f} {self.time_units}')
-        else:
-            plt.suptitle(f'Job Search Trajectory - No Offer Accepted within {self.max_time} {self.time_units}')
-        
-        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to make room for the title
-        return plt
-
-
-def explain_advanced_ost_algorithm():
-    """Explain the advanced Optimal Stopping Theory algorithm."""
-    explanation = """
-===== ADVANCED OPTIMAL STOPPING THEORY EXPLANATION =====
-
-This advanced job search optimizer represents a significant leap forward from basic OST implementations:
-
-1. CONTINUOUS-TIME STOCHASTIC MODELING:
-   - Instead of discrete weeks, we model time as a continuous variable
-   - Job offers arrive as a stochastic process (Poisson arrival process)
-   - Value functions and thresholds are calculated for every point in time
-   - Financial constraints modeled as continuous functions rather than discrete steps
-
-2. BAYESIAN LEARNING MODEL:
-   - Market conditions are unknown at the start but learned through observations
-   - Each observed job offer updates our beliefs about:
-     * The distribution of salaries in the market
-     * The distribution of job attributes (work-life balance, career growth, etc.)
-     * Market seasonality and trends
-   - Model becomes more accurate as more data is gathered during the search
-
-3. STRATEGIC INTERACTIONS WITH EMPLOYERS:
-   - Models employer negotiation strategies
-   - Considers candidate desirability and employer urgency
-   - Allows for strategic negotiation based on candidate leverage
-   - Adjusts strategies based on predicted interview success probability
-
-4. NON-STATIONARY PROCESSES:
-   - Job market evolves over time (seasonal effects, market trends)
-   - Candidate skills and desirability change over time
-   - Financial pressure increases non-linearly as runway depletes
-   - Search costs and discount rates affect value of future opportunities
-
-5. ADAPTIVE DECISION MAKING:
-   - Continuously updates optimal stopping thresholds based on new information
-   - Adapts application strategy based on market conditions and financial status
-   - Uses probability theory to balance exploration (searching) and exploitation (accepting)
-   - Considers opportunity costs of time spent searching vs. accepting suboptimal offers
-
-This model represents a theoretical optimal search strategy based on advanced stochastic control theory
-and dynamic programming. The mathematics behind it incorporate:
-
-- Martingale theory for optimal stopping problems
-- Bayesian updating for sequential decision making
-- Stochastic differential equations for continuous time processes
-- Utility theory for multi-attribute decision making
-
-The algorithm adjusts to each candidate's unique preferences and financial constraints while
-accounting for the fundamental uncertainty in job searching.
-"""
-    return explanation
-
-def run_advanced_simulation(preferences: dict, verbose_timeline=True):
-    """
-    Run an advanced job search simulation with visualizations.
+    # Final insights with field-specific context
+    final_insights = ost.get_search_insights()
     
-    Args:
-        preferences: Dictionary of user preferences
-        verbose_timeline: Whether to print detailed step-by-step timeline
-    """
-    # Create optimizer with 1 year time horizon
-    optimizer = AdvancedJobSearchOptimizer(preferences, max_time=1.0, time_units="years")
+    print("\n=== FINAL INSIGHTS WITH SEMANTIC UNDERSTANDING ===")
+    print(f"Field: {user_profile['field']}")
+    print(f"Experience level: {user_profile['experience_level']}")
+    print(f"Location: {user_profile['location']}")
+    print(f"Market condition: {final_insights['market_condition']:.2f}")
     
-    # Run the full search with detailed output
-    results = optimizer.run_full_search(verbose=verbose_timeline)
+    # Field-specific salary expectations
+    print(f"Salary expectations for {user_profile['experience_level']} {user_profile['field']} in {user_profile['location']}:")
+    print(f"  ${final_insights['expected_salary_range'][0]:,.2f} - ${final_insights['expected_salary_range'][1]:,.2f}")
     
-    # Create plots
-    plt = optimizer.plot_search_trajectory()
-    plt.savefig("advanced_job_search_trajectory.png")
+    # Most valued job attributes with semantic descriptions
+    print("\nMost valued job attributes (from observed data):")
+    for attr, value in final_insights['top_attributes'].items():
+        var_type = VARIABLE_TYPES.get(attr)
+        if var_type:
+            print(f"  {attr}: {value:.1f}/10 ({var_type.description})")
     
-    # Print simulation summary (if not already printed in verbose mode)
-    if not verbose_timeline:
-        print("\n===== ADVANCED JOB SEARCH SIMULATION RESULTS =====")
-        if results['accepted_offer']:
-            print(f"Found acceptable job offer after {results['search_duration']:.2f} years:")
-            print(f"Company: {results['accepted_offer']['company']}")
-            print(f"Salary: £{results['accepted_offer']['salary']:,.2f}")
-            print(f"Career Growth Score: {results['accepted_offer']['career_growth']}/5")
-            print(f"Work-Life Balance: {results['accepted_offer']['work_life_balance']}/5")
-            print(f"Utility: {results['accepted_offer']['utility']:.2f}")
-            
-            if results['accepted_within_runway']:
-                print(f"Accepted within financial runway ({optimizer.ost.financial_runway:.2f} years)")
-            else:
-                print(f"Accepted after financial runway depleted")
-        else:
-            print(f"No acceptable job offer found within {optimizer.max_time} years.")
-        
-        print("\n===== SEARCH STATISTICS =====")
-        print(f"Applications submitted: {results['applications_started']}")
-        print(f"Offers received: {results['offers_received']}")
-        print(f"Rejections received: {results['rejections_received']}")
-        
-        # Print strategy summary
-        strategy = results['strategy_summary']
-        print("\n===== SEARCH STRATEGY ANALYSIS =====")
-        print(f"Initial utility threshold: {strategy['initial_threshold']:.2f}")
-        print(f"Final utility threshold: {strategy['final_threshold']:.2f}")
-        print(f"Threshold decline rate: {strategy['threshold_decline_rate']:.2f} per year")
+    # Threshold evolution with semantic context
+    print("\nThreshold evolution with employment context:")
+    print(f"  Initial threshold: {ost.reservation_utilities[0]:.2f}")
+    print(f"  Mid-search threshold: {ost.reservation_utilities[50]:.2f}")
+    print(f"  Final threshold: {ost.reservation_utilities[-1]:.2f}")
     
-    # Print detailed application history
-    print("\n===== DETAILED APPLICATION TIMELINE =====")
-    print("* Applications submitted in chronological order:")
-    
-    # Collect all applications from the history
-    all_applications = []
-    for step in optimizer.search_history:
-        for app in step['applications_started']:
-            all_applications.append({
-                'company': app['company'],
-                'time': step['end_time'],
-                'type': 'submission',
-                'details': f"Est. salary: £{app['estimated_salary']:,.2f}, Career growth: {app['estimated_career_growth']}/5"
-            })
-        
-        for rej in step['applications_rejected']:
-            all_applications.append({
-                'company': rej['company'],
-                'time': step['end_time'],
-                'type': 'rejection',
-                'details': f"Time invested: {rej['time_invested']:.2f} years, Failed interview process"
-            })
-        
-        for offer in step['offers_received']:
-            all_applications.append({
-                'company': offer['company'],
-                'time': step['end_time'],
-                'type': 'offer',
-                'details': f"Salary: £{offer['salary']:,.2f}, Career growth: {offer['attributes']['career_growth']}/5"
-            })
-    
-    # Sort by time
-    all_applications.sort(key=lambda x: x['time'])
-    
-    # Print the timeline
-    for i, app in enumerate(all_applications):
-        time_str = f"{app['time']:.2f} years"
-        if app['type'] == 'submission':
-            print(f"{i+1}. Time {time_str}: Applied to {app['company']}")
-            print(f"   Details: {app['details']}")
-        elif app['type'] == 'rejection':
-            print(f"{i+1}. Time {time_str}: REJECTED by {app['company']}")
-            print(f"   Reason: {app['details']}")
-        elif app['type'] == 'offer':
-            print(f"{i+1}. Time {time_str}: OFFER received from {app['company']}")
-            print(f"   Details: {app['details']}")
-    
-    # Print detailed offer evaluation history
-    print("\n===== OFFER EVALUATION HISTORY =====")
-    print("* Decision process for each offer:")
-    
-    offer_decisions = []
-    for step in optimizer.search_history:
-        for decision in step.get('decisions', []):
-            offer_decisions.append({
-                'company': decision['offer'],
-                'time': step['end_time'],
-                'utility': decision['utility'],
-                'threshold': decision['threshold'],
-                'decision': decision['decision'],
-                'explanation': decision['explanation']
-            })
-    
-    for i, decision in enumerate(offer_decisions):
-        time_str = f"{decision['time']:.2f} years"
-        decision_str = decision['decision'].upper()
-        print(f"{i+1}. Time {time_str}: {decision['company']} - {decision_str}")
-        print(f"   Utility: {decision['utility']:.2f} vs Threshold: {decision['threshold']:.2f}")
-        print(f"   Reasoning: {decision['explanation']}")
-    
-    # Print explanation of advanced OST
-    print("\n" + explain_advanced_ost_algorithm())
-    
-    print("\nAdvanced job search simulation visualization saved as 'advanced_job_search_trajectory.png'")
-    
-    return results
-
-def main():
-    # Sample user preferences (same as original)
-    data_string = """ "user_data": [
-    {
-      "question_type": "min_salary",
-      "question": "What is the minimum annual salary you would accept for a full-time position in the UK?",
-      "response": 21450,
-      "data_type": "number"
-    },
-    {
-      "question_type": "compensation_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is compensation to you in your job search?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "career_growth_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is career growth and advancement opportunities to you in your next role?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "location_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is the location of the job (considering your current location in the UK)?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "work_life_balance_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is work-life balance to you?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "company_reputation_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is the reputation and prestige of the company to you?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "role_responsibilities_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is the variety and challenge of the role responsibilities?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "risk_tolerance",
-      "question": "On a scale of 1 to 10 (1=low, 10=high), how willing are you to wait for a better job offer if your current search isn't yielding ideal results?",
-      "response": 4,
-      "data_type": "number"
-    },
-    {
-      "question_type": "job_search_urgency",
-      "question": "On a scale of 1 to 10 (1=not urgent, 10=very urgent), how urgent is it for you to secure a new job?",
-      "response": 8,
-      "data_type": "number"
-    },
-    {
-      "question_type": "financial_runway",
-      "question": "Approximately how many months of living expenses do you currently have saved?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "current_salary",
-      "question": "What was your last annual salary (or your current salary if employed)?",
-      "response": 25000,
-      "data_type": "number"
-    },
-    {
-      "question_type": "ai_application_interest",
-      "question": "Considering your projects involving AI (ResNet, Generative AI chatbot), on a scale of 1 to 5 (1=unimportant, 5=extremely important), how interested are you in working on projects with a strong AI component?",
-      "response": 4,
-      "data_type": "number"
-    },
-    {
-      "question_type": "tech_stack_alignment_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is it for you that a role utilizes your preferred technologies (e.g., Python, React, FastAPI)?",
-      "response": 3,
-      "data_type": "number"
-    },
-    {
-      "question_type": "mentoring_opportunity_weight",
-      "question": "On a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is the opportunity for mentorship and professional development within a company?",
-      "response": 4,
-      "data_type": "number"
-    },
-    {
-      "question_type": "project_variety_weight",
-      "question": "Given your diverse experience across web design, software engineering, and system integration, on a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is having a variety of projects and challenges in your role?",
-      "response": 4,
-      "data_type": "number"
-    },
-    {
-      "question_type": "team_collaboration_weight",
-      "question": "Based on your experience at Sanoh UK and Johnson Control, on a scale of 1 to 5 (1=unimportant, 5=extremely important), how important is it for you to work in a collaborative team environment?",
-      "response": 4,
-      "data_type": "number"
-    }
-  ],"""
-    
-    # Parse user preferences
-    preferences = parse_user_data(data_string)
-    
-    print("\n" + "=" * 80)
-    print("ADVANCED OPTIMAL STOPPING THEORY JOB SEARCH SIMULATION")
-    print("=" * 80)
-    print("\nThis simulation provides a detailed view of the job search process using advanced")
-    print("Optimal Stopping Theory with Bayesian updating and continuous-time stochastic modeling.")
-    print("\nBALANCING FACTORS:")
-    print(f"- Urgency level: {preferences.get('job_search_urgency', 5)}/10 (higher means less selective)")
-    print(f"- Risk tolerance: {preferences.get('risk_tolerance', 5)}/10 (higher means more selective)")
-    print(f"- Financial runway: {preferences.get('financial_runway', 3)} months")
-    print(f"- Current salary: £{preferences.get('current_salary', 25000):,}")
-    print(f"- Minimum acceptable salary: £{preferences.get('min_salary', 20000):,}")
-    
-    print("\nKEY PRIORITIES (rated 4-5 out of 5):")
-    priorities = []
-    for key, value in preferences.items():
-        if '_weight' in key and value >= 4:
-            name = key.replace('_weight', '').replace('_', ' ').title()
-            priorities.append(f"{name} ({value}/5)")
-    if preferences.get('ai_application_interest', 0) >= 4:
-        priorities.append(f"AI Component ({preferences.get('ai_application_interest')}/5)")
-    
-    if priorities:
-        for priority in priorities:
-            print(f"- {priority}")
+    if user_profile['employment_status'] == 'unemployed':
+        print("  Note: Thresholds decrease more rapidly for unemployed job seekers")
     else:
-        print("- No strong priorities identified (all factors rated 3/5 or lower)")
+        print("  Note: Being employed allowed for more selective thresholds")
     
-    print("\nStarting simulation now. Each step represents approximately 2-3 weeks of job searching...\n")
-    print("=" * 80)
+    # Field-specific fatigue factors
+    if user_profile['field'] == 'software_engineering':
+        print(f"\nTech interview fatigue factor: {ost.fatigue_factor:.2f}")
+        print("  Note: Tech interviews often involve multiple rounds and technical assessments")
+    else:
+        print(f"\nInterview fatigue factor: {ost.fatigue_factor:.2f}")
     
-    # Run the advanced simulation
-    run_advanced_simulation(preferences)
+    print(f"Total rejections made: {ost.rejections_made}")
 
+# Run the simulation
 if __name__ == "__main__":
-    main()
+    run_semantic_ost_simulation()
