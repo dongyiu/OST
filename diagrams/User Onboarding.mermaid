@@ -1,46 +1,67 @@
-%%{init: {'theme': 'neutral', 'themeVariables': { 'fontSize': '12px'}}}%%
+---
+config:
+  theme: neutral
+  themeVariables:
+    fontSize: 14px
+---
 flowchart TD
-    %% Main System Flow
-    Resume[["Resume PDF"]] --> Parser[[PDF Parser]]
-    Parser -->|Extracted Text| Extractor[[Job Field Extractor]]
-    Extractor -->|Job Field| Generator[[Question Generator]]
-    Generator -->|Personalized Questions| Manager[[Dynamic Question Manager]]
-    Manager -->|Structured Data| Storage[[Data Storage]]
-    Storage --> MongoDB[("MongoDB<br>---<br>• Session ID<br>• Job Field<br>• Standard Variables<br>• Custom Variables<br>• API Stats")]
-
-    %% API Subsystem
-    subgraph Rate_Limited["Rate-Optimized API Gateway"]
-        direction TB
-        API[[Rate-Limited API]] -->|Exponential<br>Backoff| Retry
-        API -->|Cache<br>Management| Cache[SimpleCache]
-        API --> Gemini[[Gemini API]]
-    end
-
-    %% Meta-Reasoning
-    subgraph Meta_System["Meta-Reasoning Controller"]
-        direction TB
-        MA1[["API Call Tracking<br>Consecutive Calls<br>Error Counters"]]
-        MA2[["Confidence Analysis<br>Progress Monitoring<br>Similarity Checks"]]
-        MA3[["Circular Reasoning<br>Detection<br>History Tracking"]]
-        MA4[["Efficiency Analysis<br>Cost-Benefit Decisions<br>User Intervention"]]
-    end
-
-    %% User Interaction
-    User[["Job Seeker"]] -->|Upload| Resume
-    User <-->|Q&A Session| Manager
-
-    %% Connections
-    Extractor -->|Uses| Rate_Limited
-    Generator -->|Uses| Rate_Limited
-    Manager -->|Uses| Rate_Limited
-    Manager -->|Consults| Meta_System
-    Meta_System -->|Monitors| Rate_Limited
-
-    %% Styling
-    classDef box fill:#e0f2fe,stroke:#0369a1;
-    classDef process fill:#f0fdf4,stroke:#15803d;
-    classDef data fill:#fff1f2,stroke:#be123c;
-    
-    class Rate_Limited,Meta_System box
-    class Parser,Extractor,Generator,Manager,Storage,API,Retry,Cache,Gemini process
-    class Resume,User,MongoDB data
+ subgraph MetaReasoning["Meta-Reasoning Controller"]
+    direction TB
+        M2["Confidence Analyzer"]
+        M1["API Call Tracker"]
+        M3["Efficiency Optimizer"]
+        M4["History Manager"]
+  end
+ subgraph APIGateway["Rate-Optimized Workflow"]
+    direction TB
+        A2["Cache Layer"]
+        A1["API Client"]
+        A3{"Resource Exhausted?"}
+        A4["Exponential Backoff"]
+        A5["Retry Handler"]
+        A6["Gemini API"]
+  end
+    A("Resume PDF") --> B["PDF Parser"]
+    B --> C["Job Field Extractor"]
+    C --> D["Question Generator"]
+    D --> E["Dynamic Question Manager"]
+    F["Data Storage"] --> G("MongoDB")
+    M1 --> M2
+    M2 --> M3
+    M3 --> M4
+    A1 --> A2
+    A2 --> A3
+    A3 -- Yes --> A4
+    A4 --> A5
+    A5 --> A1
+    A3 -- No --> A6
+    User("Job Seeker") -- Upload Resume --> A
+    User <-- Adaptive Q&A --> E
+    C -- Uses --> APIGateway
+    D -- Uses --> APIGateway
+    E -- Consults --> MetaReasoning
+    MetaReasoning -- Monitors --> APIGateway
+    E -- Uses --> APIGateway
+    E -- Writes --> F
+     A:::data
+     B:::process
+     C:::process
+     D:::process
+     E:::process
+     F:::process
+     G:::data
+     M1:::process
+     M2:::process
+     M3:::process
+     M4:::process
+     A1:::process
+     A2:::process
+     A4:::process
+     A5:::process
+     A6:::process
+     User:::data
+     APIGateway:::box
+     MetaReasoning:::box
+    classDef box fill:#e0f2fe,stroke:#0369a1
+    classDef process fill:#f0fdf4,stroke:#15803d
+    classDef data fill:#fff1f2,stroke:#be123c
