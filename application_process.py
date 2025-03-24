@@ -293,14 +293,18 @@ class DataEnrichmentAgent:
         if self.meta_agent:
             self.meta_agent.reset_consecutive()
         
+        print("🔍 ENRICHING APPLICATION DATA")
+        
         # Add company information if available
         company_name = application_data.get("company")
         if company_name:
+            print(f"🏢 Fetching information for company: {company_name}")
             company_info = self.web_scraper.scrape_company_info(company_name)
             enriched_data["company_info"] = company_info
         
         # Extract and structure salary information
         if "salary" in application_data and application_data["salary"]:
+            print("💰 Extracting structured salary information")
             try:
                 prompt = f"""
                 Extract structured salary information from this text:
@@ -328,17 +332,20 @@ class DataEnrichmentAgent:
                     # Try to parse as JSON
                     salary_info = json.loads(response.text)
                     enriched_data["structured_salary"] = salary_info
+                    print("✅ Salary information extracted successfully")
                 except json.JSONDecodeError:
                     # Fallback if not valid JSON
                     enriched_data["structured_salary"] = {
                         "base_salary": None,
                         "error": "Failed to parse salary information"
                     }
+                    print("⚠️ Failed to parse salary information as JSON")
             except Exception as e:
                 print(f"❌ Error extracting salary information: {str(e)}")
         
         # Extract job skills and requirements
         if "description" in application_data and application_data["description"]:
+            print("🧠 Extracting job requirements and skills")
             try:
                 prompt = f"""
                 Extract key job requirements and skills from this job description:
@@ -363,11 +370,13 @@ class DataEnrichmentAgent:
                     # Try to parse as JSON
                     job_requirements = json.loads(response.text)
                     enriched_data["job_requirements"] = job_requirements
+                    print("✅ Job requirements extracted successfully")
                 except json.JSONDecodeError:
                     # Fallback if not valid JSON
                     enriched_data["job_requirements"] = {
                         "error": "Failed to parse job requirements"
                     }
+                    print("⚠️ Failed to parse job requirements as JSON")
             except Exception as e:
                 print(f"❌ Error extracting job requirements: {str(e)}")
         
@@ -375,8 +384,9 @@ class DataEnrichmentAgent:
         enriched_data["enrichment_date"] = datetime.now().isoformat()
         enriched_data["enrichment_status"] = "completed"
         
+        print("✅ Data enrichment completed")
+        
         return enriched_data
-
 
 class JobQualityAssessmentAgent:
     """
@@ -419,9 +429,7 @@ class JobQualityAssessmentAgent:
         for metric_dict in self.config.standard_metrics:
             metric_key = metric_dict["key"]
             
-            print(f"\n{'*'*100}")
-            print(f"🔍 ASSESSING: {metric_dict['name'].upper()}")
-            print(f"{'*'*100}")
+            print(f"\n🔍 ASSESSING: {metric_dict['name'].upper()}")
             
             # Evaluate the metric with direct reasoning
             score, confidence, reasoning_steps = self._evaluate_metric(
@@ -449,7 +457,6 @@ class JobQualityAssessmentAgent:
                 print(f"   Confidence: {confidence:.2f}")
                 print(f"\n📝 REASONING SUMMARY:")
                 print(f"   {reasoning_summary}")
-                print(f"{'*'*100}")
             
             # Store detailed reasoning traces
             reasoning_traces.extend([
@@ -475,9 +482,7 @@ class JobQualityAssessmentAgent:
         # Generate an overall job quality score
         try:
             if self.verbose:
-                print(f"\n{'*'*100}")
-                print(f"🏆 CALCULATING OVERALL JOB QUALITY SCORE")
-                print(f"{'*'*100}")
+                print(f"\n🏆 CALCULATING OVERALL JOB QUALITY SCORE")
                 
             overall_score = self._calculate_overall_score(job_quality_metrics, user_preferences)
             job_quality_metrics["overall_score"] = overall_score
@@ -488,7 +493,6 @@ class JobQualityAssessmentAgent:
                 print(f"   Confidence: {overall_score['confidence']:.2f}")
                 print(f"\n📝 REASONING SUMMARY:")
                 print(f"   {overall_score['reasoning_summary']}")
-                print(f"{'*'*100}")
                 
         except Exception as e:
             print(f"❌ Error calculating overall score: {str(e)}")
@@ -534,7 +538,6 @@ class JobQualityAssessmentAgent:
             
             if self.verbose:
                 print(f"\n💭 REASONING STEP {attempt}/{self.config.max_reasoning_attempts}")
-                print(f"{'='*80}")
             
             # If we're doing a follow-up reasoning step, include previous steps
             previous_reasoning = ""
@@ -620,9 +623,7 @@ class JobQualityAssessmentAgent:
                 # Display reasoning if verbose mode is on
                 if self.verbose:
                     print(f"\n💡 REASONING OUTPUT:")
-                    print(f"{'='*80}")
                     print(reasoning)
-                    print(f"{'='*80}")
                     print(f"📊 Score: {score:.1f}/10 (Confidence: {confidence:.2f})")
                     if confidence >= self.config.confidence_threshold:
                         print(f"✅ Confidence threshold met!")
@@ -769,19 +770,17 @@ class JobQualityAssessmentAgent:
         
     def _display_assessment_header(self, application_data: Dict, user_preferences: Dict):
         """Display a summary of the application and user preferences"""
-        print(f"\n{'='*100}")
-        print(f"🔍 JOB QUALITY ASSESSMENT")
-        print(f"{'='*100}")
+        print("\n🔍 JOB QUALITY ASSESSMENT START")
         
         # Application info
-        print(f"📋 APPLICATION DETAILS:")
+        print("📋 APPLICATION DETAILS:")
         print(f"   Company: {application_data.get('company', 'Unknown')}")
         print(f"   Position: {application_data.get('position', 'Unknown')}")
         print(f"   Location: {application_data.get('location', 'Not specified')}")
         print(f"   Status: {application_data.get('stage', 'Unknown')}")
         
         # User preferences
-        print(f"\n👤 USER PREFERENCES:")
+        print("\n👤 USER PREFERENCES:")
         print(f"   Minimum Salary: ${user_preferences.get('min_salary', 'Not specified')}")
         
         if 'preference_weights' in user_preferences:
@@ -799,9 +798,6 @@ class JobQualityAssessmentAgent:
         
         print(f"   Current Salary: ${user_preferences.get('current_salary', 'Not specified')}")
         print(f"   Financial Runway: {user_preferences.get('financial_runway', 'Not specified')} months")
-        
-        print(f"{'='*100}")
-
 
 class DataCollectionAgent:
     """
@@ -849,7 +845,7 @@ class DataCollectionAgent:
             field = item["field"]
             question = item["question"]
             
-            print(f"\n{question}")
+            print(f"\n❓ {question}")
             response = input("Your answer: ")
             
             updated_data[field] = response
@@ -1129,19 +1125,19 @@ def process_application(application_data, user_preferences, automated=True):
     
     if result:
         print("✅ Application processing completed successfully!")
-        print(f"Application ID: {application_data.get('id', 'N/A')}")
+        print(f"📄 Application ID: {application_data.get('id', 'N/A')}")
         
         # Print overall job quality score
         overall_score = result.get("job_quality_metrics", {}).get("overall_score", {})
         if overall_score:
-            print(f"Overall Job Quality Score: {overall_score.get('score', 'N/A')}/10")
-            print(f"Reasoning: {overall_score.get('reasoning_summary', 'N/A')}")
+            print(f"🌟 Overall Job Quality Score: {overall_score.get('score', 'N/A')}/10")
+            print(f"📝 Reasoning: {overall_score.get('reasoning_summary', 'N/A')}")
         
         return result
     else:
         print("❌ Application processing failed")
         return None
-
+    
 # Example usage
 if __name__ == "__main__":
     # Example application data
@@ -1201,16 +1197,16 @@ if __name__ == "__main__":
     
     # Examine results
     if assessment_result and "job_quality_metrics" in assessment_result:
-        print("\n📊 JOB QUALITY ASSESSMENT RESULTS:\n")
+        print("\n📊 JOB QUALITY ASSESSMENT RESULTS")
         
         metrics = assessment_result["job_quality_metrics"]
         overall = metrics.get("overall_score", {})
         
-        print(f"Overall Job Quality Score: {overall.get('score', 'N/A'):.1f}/10")
-        print(f"Reasoning: {overall.get('reasoning_summary', 'N/A')}")
+        print(f"🌟 Overall Job Quality Score: {overall.get('score', 'N/A'):.1f}/10")
+        print(f"📝 Reasoning: {overall.get('reasoning_summary', 'N/A')}")
         
-        print("\nIndividual Metrics:")
+        print("\n📈 Individual Metrics:")
         for key, metric in metrics.items():
             if key != "overall_score":
-                print(f"\n{metric['name']}: {metric['score']:.1f}/10")
-                print(f"Reasoning: {metric['reasoning_summary']}")
+                print(f"\n✓ {metric['name']}: {metric['score']:.1f}/10")
+                print(f"  {metric['reasoning_summary']}")
