@@ -856,7 +856,46 @@ class DataCollectionAgent:
         
         return updated_data
 
-
+class AutomatedDataCollectionAgent(DataCollectionAgent):
+    """
+    Automated version of DataCollectionAgent that doesn't require user input.
+    """
+    def collect_missing_data(self, application_data: Dict) -> Dict:
+        """Collect missing data automatically without user input"""
+        updated_data = application_data.copy()
+        
+        # Identify missing fields
+        missing_fields = self.identify_missing_data(updated_data)
+        
+        if not missing_fields:
+            print("✅ All essential information is available")
+            return updated_data
+        
+        print("\n📋 Automatically filling missing information about this job application:")
+        
+        # Default values for common fields
+        default_values = {
+            "company": "Unknown Company",
+            "position": "Unspecified Position",
+            "description": "No description provided. This is a placeholder job description " +
+                          "for automated processing. The role involves general professional duties.",
+            "salary": "Salary information not available",
+            "location": "Remote/Flexible"
+        }
+        
+        # Fill in missing fields with defaults
+        for item in missing_fields:
+            field = item["field"]
+            question = item["question"]
+            
+            print(f"\n{question}")
+            default_value = default_values.get(field, "Not specified")
+            print(f"Auto-filled with: {default_value}")
+            
+            updated_data[field] = default_value
+        
+        return updated_data
+    
 ###########################################
 # APPLICATION PROCESSING WORKFLOW
 ###########################################
@@ -866,12 +905,14 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
     Builder for the application processing workflow.
     """
     def __init__(self, 
-                 registry: WorkflowRegistry,
-                 meta_agent: MetaReasoningAgent,
-                 storage: StorageInterface,
-                 config: ApplicationProcessingConfig):
+                registry: WorkflowRegistry,
+                meta_agent: MetaReasoningAgent,
+                storage: StorageInterface,
+                config: ApplicationProcessingConfig,
+                automated: bool = True):  # Add automated flag
         super().__init__(registry, meta_agent, storage)
         self.config = config
+        self.automated = automated
         
         # Initialize agents
         self.email_parser = EmailParserAgent(meta_agent.ai_model)
@@ -886,8 +927,13 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
             config=config,
             meta_agent=meta_agent
         )
-        self.data_collection = DataCollectionAgent(meta_agent.ai_model)
-    
+        
+        # Use automated data collection agent if automated flag is set
+        if automated:
+            self.data_collection = AutomatedDataCollectionAgent(meta_agent.ai_model)
+        else:
+            self.data_collection = DataCollectionAgent(meta_agent.ai_model)
+            
     def build_graph(self) -> StateGraph:
         """Build the application processing workflow graph"""
         
@@ -999,9 +1045,12 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
 # APPLICATION SETUP AND USAGE EXAMPLE
 ###########################################
 
-def setup_application_processing():
+def setup_application_processing(automated=True):
     """
     Set up and configure the application processing workflow.
+    
+    Args:
+        automated: If True, use the automated agents that don't require user input
     """
     # Create configuration
     config = ApplicationProcessingConfig(
@@ -1015,44 +1064,52 @@ def setup_application_processing():
     registry = WorkflowRegistry()
     
     # Configure AI model (replace with your API key)
-    # In a real implementation, you would get this from main.py
     import google.generativeai as genai
     model = genai.GenerativeModel("gemini-1.5-flash")
     
-    # Instead of creating a new RateLimitedAPI, we would get it from main
-    # For this example, we'll import and create it directly
-    from main import RateLimitedAPI, MetaReasoningAgent, MongoDBStorage
+    # Import the required classes
+    from main import RateLimitedAPI, MetaReasoningAgent, AutomatedMetaReasoningAgent, MongoDBStorage
     
     ai_model = RateLimitedAPI(model, min_delay=2.0, max_delay=10.0)
     
-    meta_agent = MetaReasoningAgent(
-        ai_model=ai_model,
-        max_consecutive_calls=10,
-        max_reasoning_per_variable=5
-    )
+    # Use the appropriate meta agent based on the automated flag
+    if automated:
+        meta_agent = AutomatedMetaReasoningAgent(
+            ai_model=ai_model,
+            max_consecutive_calls=10,
+            max_reasoning_per_variable=5
+        )
+    else:
+        meta_agent = MetaReasoningAgent(
+            ai_model=ai_model,
+            max_consecutive_calls=10,
+            max_reasoning_per_variable=5
+        )
     
     storage = MongoDBStorage(database_name="job_applications_db")
     
     # Build and register workflow
-    builder = ApplicationProcessingWorkflowBuilder(registry, meta_agent, storage, config)
+    builder = ApplicationProcessingWorkflowBuilder(
+        registry, meta_agent, storage, config, automated=automated
+    )
     builder.register_workflow("application_processing")
     
     return registry, config, meta_agent
 
-
-def process_application(application_data, user_preferences):
+def process_application(application_data, user_preferences, automated=True):
     """
     Process a job application and assess its quality.
     
     Args:
         application_data: Basic application information
         user_preferences: User preference variables
+        automated: If True, use the automated workflow that doesn't require user input
         
     Returns:
         The assessment results
     """
     print("🚀 Setting up application processing workflow...")
-    registry, config, meta_agent = setup_application_processing()
+    registry, config, meta_agent = setup_application_processing(automated=automated)
     
     # Create workflow executor
     from main import WorkflowExecutor
@@ -1063,7 +1120,7 @@ def process_application(application_data, user_preferences):
         "workflow_id": config.workflow_id,
         "application_data": application_data,
         "user_preferences": user_preferences,
-        "meta_data": {"source": "api"}
+        "meta_data": {"source": "api", "automated": automated}
     }
     
     # Run the workflow
@@ -1084,7 +1141,6 @@ def process_application(application_data, user_preferences):
     else:
         print("❌ Application processing failed")
         return None
-
 
 # Example usage
 if __name__ == "__main__":
@@ -1140,8 +1196,8 @@ if __name__ == "__main__":
         "current_salary": 110000
     }
     
-    # Process the application
-    assessment_result = process_application(application_data, user_preferences)
+    # Process the application with automated=True to avoid user input prompts
+    assessment_result = process_application(application_data, user_preferences, automated=True)
     
     # Examine results
     if assessment_result and "job_quality_metrics" in assessment_result:

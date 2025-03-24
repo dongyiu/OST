@@ -424,7 +424,101 @@ class MetaReasoningAgent(BaseAgent):
         # Implementation depends on use case, this is a placeholder
         return input_data
 
-
+class AutomatedMetaReasoningAgent(MetaReasoningAgent):
+    """
+    A version of MetaReasoningAgent that never prompts for user input.
+    Always continues processing with sensible defaults.
+    """
+    
+    def check_and_handle(self, variable: Optional[str] = None, confidence: Optional[float] = None) -> bool:
+        """
+        Automated version that never requests user input.
+        Returns True to proceed with reasoning, False to skip based on automated rules.
+        """
+        # Track variable-specific reasoning if provided
+        if variable is not None and confidence is not None:
+            continue_reasoning, reason = self.should_continue_reasoning(variable, confidence)
+            if not continue_reasoning:
+                print(f"⚠️ Automatically stopping reasoning on '{variable}': {reason}")
+                return False
+        
+        # Check overall consecutive call limit
+        if self.consecutive_calls >= self.max_consecutive_calls:
+            analysis = self.analyze_reasoning_process()
+            if analysis:
+                print(f"\n🔍 Meta-analysis: {analysis['message']}")
+                print(f"Recommendation: {analysis['recommendation']}")
+            
+            print(f"\n⚠️ Rate limit reached: {self.consecutive_calls} consecutive AI reasoning steps.")
+            print(f"Total API calls so far: {self.total_calls}")
+            print("Automatically continuing reasoning (no user input required)")
+            
+            # Always reset consecutive counter and continue
+            self.reset_consecutive()
+        
+        # Perform occasional reasoning analysis
+        elif self.consecutive_calls >= 3:
+            analysis = self.analyze_reasoning_process()
+            if analysis and analysis['status'] == 'inefficient':
+                print(f"\n🔍 Meta-analysis: {analysis['message']}")
+                print(f"Recommendation: {analysis['recommendation']}")
+                
+                # Make automated decision based on confidence
+                # If confidence is very low, we might want to stop
+                should_continue = True
+                if 'avg_confidence' in analysis and analysis.get('avg_confidence', 0.5) < 0.3:
+                    print("Automatically stopping further reasoning due to very low confidence")
+                    should_continue = False
+                else:
+                    print("Automatically continuing with reasoning")
+                
+                return should_continue
+        
+        return True
+    
+    def analyze_reasoning_process(self) -> Optional[Dict]:
+        """
+        Overridden to include average confidence in the analysis results
+        to support automated decision making.
+        """
+        # Only analyze after some time has passed to avoid too frequent analyses
+        current_time = time.time()
+        if current_time - self.last_analysis_time < 5:  # At least 5 seconds between analyses
+            return None
+        
+        self.last_analysis_time = current_time
+        
+        if self.consecutive_calls >= 3:  # Analyze after 3+ consecutive calls
+            total_variables = len(self.reasoning_history.history)
+            variables_at_threshold = sum(1 for var in self.reasoning_history.history 
+                                        if len(self.reasoning_history.history[var]) >= self.max_reasoning_per_variable)
+            
+            confidences = [history[-1]["confidence"] 
+                           for var, history in self.reasoning_history.history.items() 
+                           if history]
+            
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+            
+            # If we're analyzing too much with little progress
+            if variables_at_threshold > 0 or avg_confidence < 0.5:
+                return {
+                    "status": "inefficient",
+                    "message": f"Reasoning appears inefficient. Analyzed {total_variables} variables with avg confidence {avg_confidence:.2f}.",
+                    "recommendation": "Consider simplifying reasoning approach.",
+                    "avg_confidence": avg_confidence
+                }
+            
+            # If we're making reasonable progress
+            if avg_confidence >= 0.6:
+                return {
+                    "status": "productive",
+                    "message": f"Reasoning is productive with {total_variables} variables and avg confidence {avg_confidence:.2f}.",
+                    "recommendation": "Continue current approach.",
+                    "avg_confidence": avg_confidence
+                }
+        
+        return None
+    
 ###########################################
 # WORKFLOW FRAMEWORK LAYER
 ###########################################
@@ -1059,7 +1153,7 @@ def setup_resume_workflow():
     model = genai.GenerativeModel("gemini-1.5-flash")
     ai_model = RateLimitedAPI(model, min_delay=2.0, max_delay=10.0)
     
-    meta_agent = MetaReasoningAgent(
+    meta_agent = AutomatedMetaReasoningAgent(
         ai_model=ai_model,
         max_consecutive_calls=5,
         max_reasoning_per_variable=3
