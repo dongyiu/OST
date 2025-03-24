@@ -34,6 +34,7 @@ class ApplicationState(BaseWorkflowState):
     user_preferences: Dict  # User preference variables
     job_quality_metrics: Dict  # Assessed job quality metrics
     reasoning_traces: List[Dict]  # Traces of reasoning steps
+    knowledge_gaps: Dict  # Identified information gaps that need research
 
 
 class JobQualityMetric:
@@ -45,7 +46,8 @@ class JobQualityMetric:
                  min_val: float, 
                  max_val: float, 
                  weight: float = 1.0,
-                 extraction_prompt: str = None):
+                 extraction_prompt: str = None,
+                 required_info: List[str] = None):
         self.key = key
         self.name = name
         self.description = description
@@ -53,6 +55,8 @@ class JobQualityMetric:
         self.max = max_val
         self.weight = weight  # Default importance weight
         self.extraction_prompt = extraction_prompt or f"Extract the {name} ({description}) from the job data."
+        # New: List of information fields required to assess this metric
+        self.required_info = required_info or []
         
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
@@ -63,7 +67,8 @@ class JobQualityMetric:
             "min": self.min,
             "max": self.max,
             "weight": self.weight,
-            "extraction_prompt": self.extraction_prompt
+            "extraction_prompt": self.extraction_prompt,
+            "required_info": self.required_info
         }
         
     @classmethod
@@ -76,7 +81,8 @@ class JobQualityMetric:
             min_val=data["min"],
             max_val=data["max"],
             weight=data.get("weight", 1.0),
-            extraction_prompt=data.get("extraction_prompt")
+            extraction_prompt=data.get("extraction_prompt"),
+            required_info=data.get("required_info", [])
         )
 
 
@@ -87,19 +93,21 @@ class ApplicationProcessingConfig:
                  storage_collection: str = "applications",
                  standard_metrics: List[Dict] = None,
                  confidence_threshold: float = 0.7,
-                 max_reasoning_attempts: int = 3):
+                 max_reasoning_attempts: int = 3,
+                 max_research_attempts: int = 2):
         self.workflow_id = workflow_id
         self.storage_collection = storage_collection
         self.standard_metrics = standard_metrics or []
         self.confidence_threshold = confidence_threshold
         self.max_reasoning_attempts = max_reasoning_attempts
+        self.max_research_attempts = max_research_attempts  # New: research attempt limit
         
         # Initialize standard metrics if none provided
         if not self.standard_metrics:
             self._initialize_standard_metrics()
     
     def _initialize_standard_metrics(self):
-        """Initialize standard job quality metrics"""
+        """Initialize standard job quality metrics with required information fields"""
         self.standard_metrics = [
             JobQualityMetric(
                 key="base_salary",
@@ -108,7 +116,8 @@ class ApplicationProcessingConfig:
                 min_val=0,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Extract and evaluate the base annual salary in USD from the job data. Rate it on a scale of 1-10 based on how competitive it is."
+                extraction_prompt="Extract and evaluate the base annual salary in USD from the job data. Rate it on a scale of 1-10 based on how competitive it is.",
+                required_info=["salary_data", "industry_avg_salary", "location_factor"]
             ).to_dict(),
             JobQualityMetric(
                 key="total_compensation",
@@ -117,7 +126,8 @@ class ApplicationProcessingConfig:
                 min_val=0,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Calculate and rate the total annual compensation including base salary, bonuses, benefits, and stock options on a scale of 1-10."
+                extraction_prompt="Calculate and rate the total annual compensation including base salary, bonuses, benefits, and stock options on a scale of 1-10.",
+                required_info=["salary_data", "benefits_data", "equity_data", "industry_comp_data"]
             ).to_dict(),
             JobQualityMetric(
                 key="job_match_score",
@@ -126,7 +136,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate how well the job requirements match the user's skills and experience on a scale of 1-10."
+                extraction_prompt="Rate how well the job requirements match the user's skills and experience on a scale of 1-10.",
+                required_info=["job_requirements", "user_skills", "user_experience"]
             ).to_dict(),
             JobQualityMetric(
                 key="company_rating",
@@ -135,7 +146,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate the company based on its reputation, financial stability, and market position on a scale of 1-10."
+                extraction_prompt="Rate the company based on its reputation, financial stability, and market position on a scale of 1-10.",
+                required_info=["company_data", "company_reviews", "company_financials", "industry_standing"]
             ).to_dict(),
             JobQualityMetric(
                 key="work_life_balance",
@@ -144,7 +156,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate the expected work-life balance for this role and company on a scale of 1-10."
+                extraction_prompt="Rate the expected work-life balance for this role and company on a scale of 1-10.",
+                required_info=["company_culture", "work_hours", "remote_policy", "employee_reviews"]
             ).to_dict(),
             JobQualityMetric(
                 key="career_growth",
@@ -153,7 +166,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate the potential for career advancement and skill development in this role on a scale of 1-10."
+                extraction_prompt="Rate the potential for career advancement and skill development in this role on a scale of 1-10.",
+                required_info=["company_growth", "promotion_track", "learning_opportunities", "company_size"]
             ).to_dict(),
             JobQualityMetric(
                 key="role_alignment",
@@ -162,7 +176,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate how well this role aligns with the user's stated career goals and interests on a scale of 1-10."
+                extraction_prompt="Rate how well this role aligns with the user's stated career goals and interests on a scale of 1-10.",
+                required_info=["job_responsibilities", "user_career_goals", "job_field", "job_level"]
             ).to_dict(),
             JobQualityMetric(
                 key="team_manager_quality",
@@ -171,7 +186,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate the quality of the team and management based on interview impressions and available information on a scale of 1-10."
+                extraction_prompt="Rate the quality of the team and management based on interview impressions and available information on a scale of 1-10.",
+                required_info=["team_structure", "manager_info", "interview_feedback", "management_style"]
             ).to_dict(),
             JobQualityMetric(
                 key="culture_fit",
@@ -180,7 +196,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate how well the company culture and values align with the user's preferences on a scale of 1-10."
+                extraction_prompt="Rate how well the company culture and values align with the user's preferences on a scale of 1-10.",
+                required_info=["company_culture", "company_values", "user_preferences", "workplace_style"]
             ).to_dict(),
             JobQualityMetric(
                 key="commute_remote_score",
@@ -189,7 +206,8 @@ class ApplicationProcessingConfig:
                 min_val=1,
                 max_val=10,
                 weight=1.0,
-                extraction_prompt="Rate the convenience of the job location and remote work options on a scale of 1-10."
+                extraction_prompt="Rate the convenience of the job location and remote work options on a scale of 1-10.",
+                required_info=["job_location", "commute_info", "remote_policy", "user_location"]
             ).to_dict(),
         ]
     
@@ -211,7 +229,8 @@ class ApplicationProcessingConfig:
             "storage_collection": self.storage_collection,
             "standard_metrics": self.standard_metrics,
             "confidence_threshold": self.confidence_threshold,
-            "max_reasoning_attempts": self.max_reasoning_attempts
+            "max_reasoning_attempts": self.max_reasoning_attempts,
+            "max_research_attempts": self.max_research_attempts
         }
     
     @classmethod
@@ -222,7 +241,8 @@ class ApplicationProcessingConfig:
             storage_collection=data.get("storage_collection", "applications"),
             standard_metrics=data.get("standard_metrics", []),
             confidence_threshold=data.get("confidence_threshold", 0.7),
-            max_reasoning_attempts=data.get("max_reasoning_attempts", 3)
+            max_reasoning_attempts=data.get("max_reasoning_attempts", 3),
+            max_research_attempts=data.get("max_research_attempts", 2)
         )
 
 
@@ -250,39 +270,1087 @@ class EmailParserAgent:
         }
 
 
-class WebScraperAgent:
+class DynamicResearchAgent:
     """
-    Agent for scraping additional information from company websites.
-    This is a placeholder implementation.
+    Enhanced agent for dynamically researching any type of information needed.
+    Uses AI to simulate web searches, data analysis, and information synthesis.
     """
-    def __init__(self, ai_model: AIModelInterface):
+    def __init__(self, ai_model: AIModelInterface, meta_agent: Optional[MetaReasoningAgent] = None):
         self.ai_model = ai_model
-    
-    def scrape_company_info(self, company_name: str, job_url: str = None) -> Dict:
-        """Scrape additional information about the company"""
-        # In a real implementation, this would use web scraping tools
-        # For this example, we'll return a simple placeholder
-        return {
-            "company_name": company_name,
-            "scraped_date": datetime.now().isoformat(),
-            "company_size": "Unknown",
-            "industry": "Unknown",
-            "founded": "Unknown",
-            "website": f"https://www.{company_name.lower().replace(' ', '')}.com",
-            "status": "scraped"
+        self.meta_agent = meta_agent
+        
+        # Track attempted research topics to avoid redundant searches
+        self.researched_topics = set()
+        
+        # Define research strategies for different information types
+        self.research_strategies = {
+            "company_data": self._research_company_basic,
+            "company_reviews": self._research_company_reviews,
+            "company_culture": self._research_company_culture,
+            "company_financials": self._research_company_financials,
+            "company_growth": self._research_company_growth,
+            "industry_avg_salary": self._research_industry_salary,
+            "industry_standing": self._research_industry_standing,
+            "industry_comp_data": self._research_industry_compensation,
+            "remote_policy": self._research_remote_policy,
+            "job_requirements": self._extract_job_requirements,
+            "salary_data": self._extract_salary_data,
+            "benefits_data": self._extract_benefits_data,
+            "equity_data": self._extract_equity_data,
+            "job_responsibilities": self._extract_job_responsibilities,
+            "team_structure": self._research_team_structure,
+            "location_factor": self._research_location_factor,
+            "commute_info": self._research_commute_info,
+            "promotion_track": self._research_promotion_track,
+            "learning_opportunities": self._research_learning_opportunities,
+            "management_style": self._research_management_style,
+            "company_values": self._research_company_values,
+            "work_hours": self._research_work_hours,
+            "employee_reviews": self._research_employee_reviews
         }
+        
+        # Research prompts for different information types
+        self.research_prompts = {
+            "company_data": "Provide factual information about {company_name}. Include company size, industry, founding year, headquarters location, and notable products or services.",
+            "company_reviews": "Based on typical employee reviews, what are the pros and cons of working at {company_name}?",
+            "company_culture": "Describe the typical company culture at {company_name}, including work environment, values, and management approach.",
+            "company_financials": "Provide information about {company_name}'s financial health, including revenue trends, profitability, and market position.",
+            "company_growth": "How has {company_name} been growing recently? Include information about expansion, hiring trends, and business development.",
+            "industry_avg_salary": "What is the average salary for {position} roles in the {industry} industry, particularly in the {location} area?",
+            "industry_standing": "How does {company_name} compare to competitors in the {industry} industry in terms of market share, innovation, and reputation?",
+            "industry_comp_data": "What is the typical total compensation package for {position} roles in {industry}, including benefits, bonuses, and equity?",
+            "remote_policy": "What is {company_name}'s policy on remote work, flexible schedules, and work-from-home options?",
+            "job_requirements": "Based on the job description, what are the key skills, qualifications, and experience requirements for this {position} role?",
+            "salary_data": "Based on the information provided, what is the salary range for this {position} role at {company_name}?",
+            "benefits_data": "What benefits are typically offered by {company_name} or mentioned in the job posting?",
+            "equity_data": "What equity or stock option benefits are mentioned or typically offered for {position} roles at {company_name}?",
+            "job_responsibilities": "What are the primary responsibilities and day-to-day tasks for this {position} role based on the job description?",
+            "team_structure": "What is the typical team structure for {position} roles at {company_name}? Include reporting relationships and team size if available.",
+            "location_factor": "How does the cost of living and job market in {location} compare to national averages?",
+            "commute_info": "What is the commute situation for working at {company_name} in {location}?",
+            "promotion_track": "What is the typical career progression path for someone in a {position} role at {company_name}?",
+            "learning_opportunities": "What professional development and learning opportunities are typically available at {company_name}?",
+            "management_style": "What is the management style and approach typically found at {company_name}?",
+            "company_values": "What are the stated or known company values and mission of {company_name}?",
+            "work_hours": "What are the typical work hours, overtime expectations, and work-life balance for {position} roles at {company_name}?",
+            "employee_reviews": "What do employee reviews say about working at {company_name}, particularly regarding work-life balance and management?"
+        }
+    
+    def research_all_gaps(self, application_data: Dict, knowledge_gaps: Dict) -> Dict:
+        """
+        Research all identified knowledge gaps and return compiled findings
+        
+        Args:
+            application_data: Current application data
+            knowledge_gaps: Dictionary of information gaps to fill
+            
+        Returns:
+            Dictionary with researched information
+        """
+        research_results = {}
+        
+        company_name = application_data.get("company", "Unknown Company")
+        position = application_data.get("position", "Unknown Position")
+        location = application_data.get("location", "Unknown Location")
+        industry = application_data.get("industry", "")
+        
+        # If industry is not in application data, try to determine it
+        if not industry and company_name and company_name != "Unknown Company":
+            industry_prompt = f"What industry is {company_name} primarily in? Provide just the industry name, no explanation."
+            try:
+                response = self.ai_model.generate_content(industry_prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                industry = response.text.strip()
+                print(f"🔍 Identified industry: {industry}")
+                research_results["industry"] = industry
+            except Exception as e:
+                print(f"❌ Error determining industry: {str(e)}")
+                industry = "Unknown Industry"
+        
+        print(f"🔍 RESEARCHING INFORMATION GAPS")
+        print(f"Company: {company_name}")
+        print(f"Position: {position}")
+        print(f"Location: {location}")
+        print(f"Industry: {industry}")
+        
+        # Create context for research
+        context = {
+            "company_name": company_name,
+            "position": position,
+            "location": location,
+            "industry": industry,
+            "job_description": application_data.get("description", ""),
+            "salary_info": application_data.get("salary", "")
+        }
+        
+        # Prioritize gaps by importance
+        priority_order = [
+            "company_data",  # Basic company info first
+            "salary_data",   # Salary is high priority
+            "job_requirements",  # Job requirements are important
+            "industry_avg_salary",  # Industry context matters
+            "location_factor",  # Location affects salary assessment
+            "remote_policy",  # Remote work is often a key factor
+        ]
+        
+        # Create sorted list of gaps
+        all_gaps = list(knowledge_gaps.keys())
+        
+        # Sort by priority first, then keep original order for the rest
+        sorted_gaps = sorted(all_gaps, key=lambda x: priority_order.index(x) if x in priority_order else 999)
+        
+        # Research each gap
+        for gap in sorted_gaps:
+            if gap in research_results or gap not in self.research_strategies:
+                continue
+                
+            # Check if we've already researched this topic
+            if gap in self.researched_topics:
+                print(f"⏩ Already researched {gap}, using cached findings")
+                continue
+                
+            print(f"\n🔍 Researching: {gap}")
+            
+            # Get the research strategy for this gap
+            research_func = self.research_strategies[gap]
+            
+            try:
+                # Execute the research
+                result = research_func(context)
+                if result:
+                    research_results[gap] = result
+                    self.researched_topics.add(gap)
+                    print(f"✅ Successfully gathered information on {gap}: {len(str(result))} characters of data")
+                    if isinstance(result, dict) and 'data' in result:
+                        preview = str(result['data'])[:100] + "..." if len(str(result['data'])) > 100 else str(result['data'])
+                        print(f"   Preview: {preview}")
+            except Exception as e:
+                print(f"❌ Error researching {gap}: {str(e)}")
+                
+        print(f"\n✅ Research completed. Found information for {len(research_results)} topics")
+        return research_results
+    
+    def _research_company_basic(self, context: Dict) -> Dict:
+        """Research basic company information"""
+        company_name = context["company_name"]
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_data"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company basic info: {str(e)}")
+            return None
+    
+    def _research_company_reviews(self, context: Dict) -> Dict:
+        """Research company reviews"""
+        company_name = context["company_name"]
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_reviews"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company reviews: {str(e)}")
+            return None
+    
+    def _research_company_culture(self, context: Dict) -> Dict:
+        """Research company culture"""
+        company_name = context["company_name"]
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_culture"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company culture: {str(e)}")
+            return None
+    
+    def _research_company_financials(self, context: Dict) -> Dict:
+        """Research company financial health"""
+        company_name = context["company_name"]
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_financials"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company financials: {str(e)}")
+            return None
+    
+    def _research_company_growth(self, context: Dict) -> Dict:
+        """Research company growth trajectory"""
+        company_name = context["company_name"]
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_growth"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company growth: {str(e)}")
+            return None
+    
+    def _research_industry_salary(self, context: Dict) -> Dict:
+        """Research industry average salary"""
+        position = context["position"]
+        industry = context.get("industry", "")
+        location = context.get("location", "")
+        
+        if position == "Unknown Position":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["industry_avg_salary"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "position": position,
+                "industry": industry,
+                "location": location,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching industry salary: {str(e)}")
+            return None
+    
+    def _research_industry_standing(self, context: Dict) -> Dict:
+        """Research company's standing in the industry"""
+        company_name = context["company_name"]
+        industry = context.get("industry", "")
+        
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["industry_standing"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "industry": industry,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching industry standing: {str(e)}")
+            return None
+    
+    def _research_industry_compensation(self, context: Dict) -> Dict:
+        """Research industry compensation packages"""
+        position = context["position"]
+        industry = context.get("industry", "")
+        
+        if position == "Unknown Position":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["industry_comp_data"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "position": position,
+                "industry": industry,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching industry compensation: {str(e)}")
+            return None
+    
+    def _research_remote_policy(self, context: Dict) -> Dict:
+        """Research remote work policy"""
+        company_name = context["company_name"]
+        position = context["position"]
+        job_description = context.get("job_description", "")
+        
+        # Check if job description already mentions remote work
+        if job_description and any(term in job_description.lower() for term in ["remote", "work from home", "wfh", "hybrid"]):
+            # Extract from job description instead of researching
+            prompt = f"""
+            Extract information about remote work policy from this job description:
+            "{job_description[:1000]}..."
+            
+            Is this job remote, hybrid, or in-office? What flexibility is offered?
+            Provide a concise assessment based only on the description.
+            """
+            
+            try:
+                response = self.ai_model.generate_content(prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                    
+                return {
+                    "source": "job_description_analysis",
+                    "company_name": company_name,
+                    "position": position,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+            except Exception as e:
+                print(f"❌ Error extracting remote policy: {str(e)}")
+        
+        # If not found in description or no description, research company policy
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["remote_policy"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching remote policy: {str(e)}")
+            return None
+    
+    def _extract_job_requirements(self, context: Dict) -> Dict:
+        """Extract job requirements from description"""
+        job_description = context.get("job_description", "")
+        position = context["position"]
+        
+        if not job_description:
+            return None
+            
+        prompt = f"""
+        Extract the key job requirements from this job description:
+        "{job_description[:1500]}..."
+        
+        Format as JSON with these fields:
+        - required_skills: List of required technical skills/tools
+        - preferred_skills: List of preferred or nice-to-have skills
+        - experience_years: Number of years of experience required
+        - education: Education requirements (degree level)
+        - certifications: Any required or preferred certifications
+        - soft_skills: Required soft skills or traits
+        
+        If a field isn't specified, use null. Be concise but complete.
+        """
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            # Try to parse as JSON
+            try:
+                # Extract JSON using regex in case there's explanatory text
+                import json
+                import re
+                
+                text = response.text
+                json_match = re.search(r'(\{.*\})', text, re.DOTALL)
+                
+                if json_match:
+                    json_str = json_match.group(1)
+                    requirements = json.loads(json_str)
+                    
+                    return {
+                        "source": "job_description_analysis",
+                        "position": position,
+                        "data": requirements,
+                        "raw_analysis": response.text.strip(),
+                        "researched_date": datetime.now().isoformat()
+                    }
+                else:
+                    # Return raw text if JSON extraction fails
+                    return {
+                        "source": "job_description_analysis",
+                        "position": position,
+                        "data": response.text.strip(),
+                        "researched_date": datetime.now().isoformat()
+                    }
+            except json.JSONDecodeError:
+                # Return raw text if JSON parsing fails
+                return {
+                    "source": "job_description_analysis",
+                    "position": position,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            print(f"❌ Error extracting job requirements: {str(e)}")
+            return None
+    
+    def _extract_salary_data(self, context: Dict) -> Dict:
+        """Extract structured salary data"""
+        salary_info = context.get("salary_info", "")
+        position = context["position"]
+        
+        if not salary_info:
+            # If no explicit salary info, try to extract from job description
+            job_description = context.get("job_description", "")
+            if not job_description:
+                return None
+                
+            prompt = f"""
+            Extract any salary or compensation information from this job description:
+            "{job_description[:1500]}..."
+            
+            If no specific numbers are mentioned, respond with "No salary information provided in the description."
+            """
+            
+            try:
+                response = self.ai_model.generate_content(prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                
+                extracted_text = response.text.strip()
+                if "No salary information" in extracted_text:
+                    return None
+                    
+                salary_info = extracted_text
+            except Exception as e:
+                print(f"❌ Error extracting salary from description: {str(e)}")
+                return None
+        
+        prompt = f"""
+        Extract structured salary information from this text:
+        "{salary_info}"
+        
+        Format as JSON with these fields:
+        - base_salary_min: Minimum annual base salary in USD (numeric, no currency symbols)
+        - base_salary_max: Maximum annual base salary in USD (numeric, no currency symbols)
+        - has_range: Boolean indicating if a salary range is provided
+        - has_bonus: Boolean indicating if bonus is mentioned
+        - bonus_details: Details about bonus structure
+        - has_equity: Boolean indicating if equity is mentioned
+        - equity_details: Details about equity
+        
+        Convert any hourly rates to annual assuming 40hrs/week, 50 weeks/year.
+        Convert any non-USD currencies to USD using typical exchange rates.
+        If a value is unknown, use null.
+        """
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            # Try to parse as JSON
+            try:
+                # Extract JSON using regex in case there's explanatory text
+                import json
+                import re
+                
+                text = response.text
+                json_match = re.search(r'(\{.*\})', text, re.DOTALL)
+                
+                if json_match:
+                    json_str = json_match.group(1)
+                    salary_data = json.loads(json_str)
+                    
+                    return {
+                        "source": "salary_analysis",
+                        "position": position,
+                        "data": salary_data,
+                        "raw_text": salary_info,
+                        "researched_date": datetime.now().isoformat()
+                    }
+                else:
+                    # Return raw text if JSON extraction fails
+                    return {
+                        "source": "salary_analysis",
+                        "position": position,
+                        "data": response.text.strip(),
+                        "raw_text": salary_info,
+                        "researched_date": datetime.now().isoformat()
+                    }
+            except json.JSONDecodeError:
+                # Return raw text if JSON parsing fails
+                return {
+                    "source": "salary_analysis",
+                    "position": position,
+                    "data": response.text.strip(),
+                    "raw_text": salary_info,
+                    "researched_date": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            print(f"❌ Error extracting structured salary data: {str(e)}")
+            return None
+    
+    def _extract_benefits_data(self, context: Dict) -> Dict:
+        """Extract benefits information"""
+        job_description = context.get("job_description", "")
+        position = context["position"]
+        company_name = context["company_name"]
+        
+        if not job_description:
+            # If no job description, research typical benefits for the company
+            if company_name == "Unknown Company":
+                return None
+                
+            prompt = f"""
+            What benefits are typically offered by {company_name}? Include health insurance, retirement, 
+            vacation, parental leave, and any other notable benefits. If you're uncertain, indicate that.
+            """
+            
+            try:
+                response = self.ai_model.generate_content(prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                    
+                return {
+                    "source": "ai_research",
+                    "company_name": company_name,
+                    "position": position,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+            except Exception as e:
+                print(f"❌ Error researching company benefits: {str(e)}")
+                return None
+        
+        # Extract from job description
+        prompt = f"""
+        Extract all benefits mentioned in this job description:
+        "{job_description[:1500]}..."
+        
+        Format as JSON with these fields:
+        - health_insurance: Details about health benefits
+        - retirement: Details about retirement benefits (401k, pension, etc.)
+        - vacation: Paid time off or vacation policy
+        - additional_benefits: List of any other benefits mentioned
+        
+        If a benefit isn't mentioned, use null for that field.
+        """
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            # Try to parse as JSON
+            try:
+                # Extract JSON using regex in case there's explanatory text
+                import json
+                import re
+                
+                text = response.text
+                json_match = re.search(r'(\{.*\})', text, re.DOTALL)
+                
+                if json_match:
+                    json_str = json_match.group(1)
+                    benefits_data = json.loads(json_str)
+                    
+                    return {
+                        "source": "job_description_analysis",
+                        "position": position,
+                        "data": benefits_data,
+                        "researched_date": datetime.now().isoformat()
+                    }
+                else:
+                    # Return raw text if JSON extraction fails
+                    return {
+                        "source": "job_description_analysis",
+                        "position": position,
+                        "data": response.text.strip(),
+                        "researched_date": datetime.now().isoformat()
+                    }
+            except json.JSONDecodeError:
+                # Return raw text if JSON parsing fails
+                return {
+                    "source": "job_description_analysis",
+                    "position": position,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            print(f"❌ Error extracting benefits data: {str(e)}")
+            return None
+    
+    def _extract_equity_data(self, context: Dict) -> Dict:
+        """Extract equity information"""
+        job_description = context.get("job_description", "")
+        salary_info = context.get("salary_info", "")
+        position = context["position"]
+        company_name = context["company_name"]
+        
+        # Combine job description and salary info for analysis
+        combined_text = f"{job_description}\n{salary_info}"
+        
+        if not combined_text.strip():
+            # If no text to analyze, research typical equity for the company/position
+            if company_name == "Unknown Company" or position == "Unknown Position":
+                return None
+                
+            prompt = f"""
+            What type of equity or stock options are typically offered for {position} roles at {company_name}? 
+            If you're uncertain about this specific company, what is typical for this position in this industry?
+            """
+            
+            try:
+                response = self.ai_model.generate_content(prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                    
+                return {
+                    "source": "ai_research",
+                    "company_name": company_name,
+                    "position": position,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+            except Exception as e:
+                print(f"❌ Error researching typical equity: {str(e)}")
+                return None
+        
+        # Extract from combined text
+        prompt = f"""
+        Extract any information about equity, stock options, RSUs, or stock-based compensation from this text:
+        "{combined_text[:1500]}..."
+        
+        Format as JSON with these fields:
+        - has_equity: Boolean indicating if equity is mentioned
+        - equity_type: Type of equity (options, RSUs, etc.)
+        - equity_amount: Amount or percentage if mentioned
+        - vesting_period: Vesting period if mentioned
+        - additional_details: Any other relevant equity details
+        
+        If equity isn't mentioned or a field is unknown, use null.
+        """
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            # Try to parse as JSON
+            try:
+                # Extract JSON using regex in case there's explanatory text
+                import json
+                import re
+                
+                text = response.text
+                json_match = re.search(r'(\{.*\})', text, re.DOTALL)
+                
+                if json_match:
+                    json_str = json_match.group(1)
+                    equity_data = json.loads(json_str)
+                    
+                    return {
+                        "source": "text_analysis",
+                        "position": position,
+                        "company_name": company_name,
+                        "data": equity_data,
+                        "researched_date": datetime.now().isoformat()
+                    }
+                else:
+                    # Return raw text if JSON extraction fails
+                    return {
+                        "source": "text_analysis",
+                        "position": position,
+                        "company_name": company_name,
+                        "data": response.text.strip(),
+                        "researched_date": datetime.now().isoformat()
+                    }
+            except json.JSONDecodeError:
+                # Return raw text if JSON parsing fails
+                return {
+                    "source": "text_analysis",
+                    "position": position,
+                    "company_name": company_name,
+                    "data": response.text.strip(),
+                    "researched_date": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            print(f"❌ Error extracting equity data: {str(e)}")
+            return None
+    
+    def _extract_job_responsibilities(self, context: Dict) -> Dict:
+        """Extract job responsibilities"""
+        job_description = context.get("job_description", "")
+        position = context["position"]
+        
+        if not job_description:
+            return None
+            
+        prompt = f"""
+        Extract the primary job responsibilities and day-to-day tasks from this job description:
+        "{job_description[:1500]}..."
+        
+        Format as a list of key responsibilities with brief descriptions. Focus only on the duties/tasks,
+        not the requirements or qualifications.
+        """
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "job_description_analysis",
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error extracting job responsibilities: {str(e)}")
+            return None
+    
+    def _research_team_structure(self, context: Dict) -> Dict:
+        """Research team structure"""
+        company_name = context["company_name"]
+        position = context["position"]
+        job_description = context.get("job_description", "")
+        
+        # First try to extract from job description if available
+        if job_description:
+            prompt = f"""
+            Extract information about team structure, reporting relationships, and team size from this job description:
+            "{job_description[:1500]}..."
+            
+            If this information isn't in the description, indicate that.
+            """
+            
+            try:
+                response = self.ai_model.generate_content(prompt)
+                if self.meta_agent:
+                    self.meta_agent.increment()
+                    
+                if "isn't in the description" not in response.text and "not mentioned" not in response.text:
+                    return {
+                        "source": "job_description_analysis",
+                        "position": position,
+                        "company_name": company_name,
+                        "data": response.text.strip(),
+                        "researched_date": datetime.now().isoformat()
+                    }
+            except Exception as e:
+                print(f"❌ Error extracting team structure from description: {str(e)}")
+        
+        # If not found in description or no description, research typical structure
+        if company_name == "Unknown Company" or position == "Unknown Position":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["team_structure"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching team structure: {str(e)}")
+            return None
+    
+    def _research_location_factor(self, context: Dict) -> Dict:
+        """Research location cost of living and job market"""
+        location = context.get("location", "")
+        position = context["position"]
+        
+        if location == "Unknown Location" or location == "Remote":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["location_factor"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "location": location,
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching location factor: {str(e)}")
+            return None
+    
+    def _research_commute_info(self, context: Dict) -> Dict:
+        """Research commute information"""
+        location = context.get("location", "")
+        company_name = context["company_name"]
+        
+        if location == "Unknown Location" or location == "Remote" or company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["commute_info"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "location": location,
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching commute info: {str(e)}")
+            return None
+    
+    def _research_promotion_track(self, context: Dict) -> Dict:
+        """Research typical promotion track"""
+        company_name = context["company_name"]
+        position = context["position"]
+        
+        if company_name == "Unknown Company" or position == "Unknown Position":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["promotion_track"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching promotion track: {str(e)}")
+            return None
+    
+    def _research_learning_opportunities(self, context: Dict) -> Dict:
+        """Research learning opportunities"""
+        company_name = context["company_name"]
+        
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["learning_opportunities"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching learning opportunities: {str(e)}")
+            return None
+    
+    def _research_management_style(self, context: Dict) -> Dict:
+        """Research management style"""
+        company_name = context["company_name"]
+        
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["management_style"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching management style: {str(e)}")
+            return None
+    
+    def _research_company_values(self, context: Dict) -> Dict:
+        """Research company values"""
+        company_name = context["company_name"]
+        
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["company_values"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching company values: {str(e)}")
+            return None
+    
+    def _research_work_hours(self, context: Dict) -> Dict:
+        """Research typical work hours"""
+        company_name = context["company_name"]
+        position = context["position"]
+        
+        if company_name == "Unknown Company" or position == "Unknown Position":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["work_hours"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "position": position,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching work hours: {str(e)}")
+            return None
+    
+    def _research_employee_reviews(self, context: Dict) -> Dict:
+        """Research employee reviews"""
+        company_name = context["company_name"]
+        
+        if company_name == "Unknown Company":
+            return None
+            
+        # Format the prompt using the template
+        prompt = self.research_prompts["employee_reviews"].format(**context)
+        
+        try:
+            response = self.ai_model.generate_content(prompt)
+            if self.meta_agent:
+                self.meta_agent.increment()
+                
+            return {
+                "source": "ai_research",
+                "company_name": company_name,
+                "data": response.text.strip(),
+                "researched_date": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"❌ Error researching employee reviews: {str(e)}")
+            return None
 
 
 class DataEnrichmentAgent:
     """
     Agent for enriching application data with additional information.
+    Now integrates with DynamicResearchAgent to gather any missing information.
     """
     def __init__(self, 
                  ai_model: AIModelInterface,
-                 web_scraper: WebScraperAgent = None,
+                 research_agent: DynamicResearchAgent = None,
                  meta_agent: MetaReasoningAgent = None):
         self.ai_model = ai_model
-        self.web_scraper = web_scraper or WebScraperAgent(ai_model)
+        self.research_agent = research_agent or DynamicResearchAgent(ai_model, meta_agent)
         self.meta_agent = meta_agent
     
     def enrich_application_data(self, application_data: Dict) -> Dict:
@@ -295,121 +1363,241 @@ class DataEnrichmentAgent:
         
         print("🔍 ENRICHING APPLICATION DATA")
         
-        # Add company information if available
-        company_name = application_data.get("company")
-        if company_name:
-            print(f"🏢 Fetching information for company: {company_name}")
-            company_info = self.web_scraper.scrape_company_info(company_name)
-            enriched_data["company_info"] = company_info
-        
-        # Extract and structure salary information
-        if "salary" in application_data and application_data["salary"]:
-            print("💰 Extracting structured salary information")
-            try:
-                prompt = f"""
-                Extract structured salary information from this text:
-                "{application_data['salary']}"
-                
-                Format your response as JSON with these fields:
-                - base_salary: The annual base salary in USD (convert if needed)
-                - salary_min: Minimum salary range if provided
-                - salary_max: Maximum salary range if provided
-                - has_bonus: Boolean indicating if bonus is mentioned
-                - bonus_details: Details about bonus structure
-                - has_equity: Boolean indicating if equity is mentioned
-                - equity_details: Details about equity
-                - has_benefits: Boolean indicating if benefits are mentioned
-                - benefits_details: Details about benefits
-                
-                Provide best estimates for numerical values.
-                """
-                
-                response = self.ai_model.generate_content(prompt)
-                if self.meta_agent:
-                    self.meta_agent.increment()
-                
-                try:
-                    # Try to parse as JSON
-                    salary_info = json.loads(response.text)
-                    enriched_data["structured_salary"] = salary_info
-                    print("✅ Salary information extracted successfully")
-                except json.JSONDecodeError:
-                    # Fallback if not valid JSON
-                    enriched_data["structured_salary"] = {
-                        "base_salary": None,
-                        "error": "Failed to parse salary information"
-                    }
-                    print("⚠️ Failed to parse salary information as JSON")
-            except Exception as e:
-                print(f"❌ Error extracting salary information: {str(e)}")
-        
-        # Extract job skills and requirements
+        # Basic data extraction from job description
         if "description" in application_data and application_data["description"]:
-            print("🧠 Extracting job requirements and skills")
-            try:
-                prompt = f"""
-                Extract key job requirements and skills from this job description:
-                "{application_data['description']}"
+            print("📄 Extracting basic information from job description")
+            
+            # Extract job requirements if not already present
+            if "job_requirements" not in enriched_data:
+                requirements_research = self.research_agent._extract_job_requirements({
+                    "job_description": application_data["description"],
+                    "position": application_data.get("position", "Unknown Position")
+                })
                 
-                Format your response as JSON with these fields:
-                - required_skills: List of explicitly required skills
-                - preferred_skills: List of preferred/nice-to-have skills
-                - experience_level: Required years of experience
-                - education_requirements: Required education level
-                - job_type: Full-time, part-time, contract, etc.
-                - remote_status: Remote, hybrid, on-site, etc.
-                
-                Keep each list item concise.
-                """
-                
-                response = self.ai_model.generate_content(prompt)
-                if self.meta_agent:
-                    self.meta_agent.increment()
-                
-                try:
-                    # Try to parse as JSON
-                    job_requirements = json.loads(response.text)
-                    enriched_data["job_requirements"] = job_requirements
+                if requirements_research:
+                    enriched_data["job_requirements"] = requirements_research
                     print("✅ Job requirements extracted successfully")
-                except json.JSONDecodeError:
-                    # Fallback if not valid JSON
-                    enriched_data["job_requirements"] = {
-                        "error": "Failed to parse job requirements"
-                    }
-                    print("⚠️ Failed to parse job requirements as JSON")
-            except Exception as e:
-                print(f"❌ Error extracting job requirements: {str(e)}")
+        
+        # Extract and structure salary information if not already present
+        if "salary" in application_data and application_data["salary"] and "structured_salary" not in enriched_data:
+            print("💰 Extracting structured salary information")
+            
+            salary_research = self.research_agent._extract_salary_data({
+                "salary_info": application_data["salary"],
+                "position": application_data.get("position", "Unknown Position")
+            })
+            
+            if salary_research:
+                enriched_data["structured_salary"] = salary_research
+                print("✅ Salary information extracted successfully")
+        
+        # Identify gaps for more targeted research
+        basic_research_needs = [
+            "company_data",  # Basic company information
+            "job_requirements",  # Job requirements if not already extracted
+            "salary_data"  # Salary data if not already extracted
+        ]
+        
+        research_context = {
+            "company_name": application_data.get("company", "Unknown Company"),
+            "position": application_data.get("position", "Unknown Position"),
+            "location": application_data.get("location", "Unknown Location"),
+            "job_description": application_data.get("description", ""),
+            "salary_info": application_data.get("salary", "")
+        }
+        
+        # Perform basic research for key fields
+        print("\n🔍 CONDUCTING BASIC RESEARCH")
+        for need in basic_research_needs:
+            # Skip if we already have this data
+            if need == "job_requirements" and "job_requirements" in enriched_data:
+                continue
+            if need == "salary_data" and "structured_salary" in enriched_data:
+                continue
+                
+            research_func = getattr(self.research_agent, f"_research_{need}", None) or getattr(self.research_agent, f"_extract_{need}", None)
+            
+            if research_func:
+                print(f"Researching: {need}")
+                try:
+                    result = research_func(research_context)
+                    if result:
+                        # Store with standardized names
+                        if need == "company_data":
+                            enriched_data["company_info"] = result
+                        elif need == "job_requirements" and "job_requirements" not in enriched_data:
+                            enriched_data["job_requirements"] = result
+                        elif need == "salary_data" and "structured_salary" not in enriched_data:
+                            enriched_data["structured_salary"] = result
+                            
+                        print(f"✅ Successfully gathered {need}")
+                except Exception as e:
+                    print(f"❌ Error during {need} research: {str(e)}")
         
         # Add metadata
         enriched_data["enrichment_date"] = datetime.now().isoformat()
         enriched_data["enrichment_status"] = "completed"
         
-        print("✅ Data enrichment completed")
+        print("✅ Initial data enrichment completed")
         
         return enriched_data
 
+
 class JobQualityAssessmentAgent:
     """
-    Agent for assessing job quality metrics using direct reasoning, similar to the user preference system.
+    Enhanced agent for assessing job quality metrics using direct reasoning and dynamic research.
     """
     def __init__(self, 
                  ai_model: AIModelInterface,
                  config: ApplicationProcessingConfig,
+                 research_agent: DynamicResearchAgent,
                  meta_agent: Optional[MetaReasoningAgent] = None):
         self.ai_model = ai_model
         self.config = config
+        self.research_agent = research_agent
         self.meta_agent = meta_agent
         self.verbose = True  # Enable detailed output
     
+    def identify_knowledge_gaps(self, 
+                               metrics_to_assess: List[str], 
+                               application_data: Dict) -> Dict[str, bool]:
+        """
+        Identify missing information needed for accurate assessment
+        
+        Args:
+            metrics_to_assess: List of metric keys to assess
+            application_data: Current application and enriched data
+            
+        Returns:
+            Dictionary of information gaps with boolean priority
+        """
+        knowledge_gaps = {}
+        
+        print("\n🔍 IDENTIFYING KNOWLEDGE GAPS")
+        
+        # Get all required information fields for the metrics we need to assess
+        for metric_key in metrics_to_assess:
+            metric_dict = self.config.get_metric(metric_key)
+            if not metric_dict:
+                continue
+                
+            required_info = metric_dict.get("required_info", [])
+            for info_key in required_info:
+                # Check if we have this information already
+                if self._check_info_available(info_key, application_data):
+                    if self.verbose:
+                        print(f"✅ {info_key} is available")
+                    continue
+                
+                # This is a gap we need to fill
+                # Determine priority based on which metric needs it
+                if metric_key in ["base_salary", "total_compensation", "job_match_score", "company_rating"]:
+                    # High priority for core metrics
+                    knowledge_gaps[info_key] = True
+                    print(f"❗ Critical gap identified: {info_key} (needed for {metric_key})")
+                else:
+                    # Standard priority
+                    knowledge_gaps[info_key] = knowledge_gaps.get(info_key, False)
+                    if self.verbose:
+                        print(f"🔍 Gap identified: {info_key} (needed for {metric_key})")
+        
+        # Sort gaps by priority (critical first)
+        sorted_gaps = sorted(knowledge_gaps.items(), key=lambda x: x[1], reverse=True)
+        
+        print(f"Identified {len(sorted_gaps)} knowledge gaps to fill")
+        return dict(sorted_gaps)
+    
+    def _check_info_available(self, info_key: str, application_data: Dict) -> bool:
+        """
+        Check if required information is available in application data
+        
+        Args:
+            info_key: Information field to check
+            application_data: Current application data
+            
+        Returns:
+            Boolean indicating if information is available
+        """
+        # Map info keys to paths in application data where they might be found
+        info_paths = {
+            "salary_data": ["structured_salary", "salary"],
+            "industry_avg_salary": ["industry_data", "researched_data.industry_avg_salary", "enriched_data.industry_avg_salary"],
+            "location_factor": ["location_data", "researched_data.location_factor"],
+            "benefits_data": ["benefits", "structured_benefits", "researched_data.benefits_data"],
+            "equity_data": ["equity", "structured_equity", "researched_data.equity_data"],
+            "job_requirements": ["job_requirements", "extracted_job_info.requirements"],
+            "user_skills": ["user_preferences.skills", "user_data.skills"],
+            "user_experience": ["user_preferences.experience", "user_data.experience"],
+            "company_data": ["company_info", "researched_data.company_data"],
+            "company_reviews": ["company_reviews", "researched_data.company_reviews"],
+            "company_financials": ["company_financials", "researched_data.company_financials"],
+            "industry_standing": ["industry_standing", "researched_data.industry_standing"],
+            "company_culture": ["company_culture", "researched_data.company_culture", "extracted_job_info.culture"],
+            "work_hours": ["work_hours", "extracted_job_info.hours", "researched_data.work_hours"],
+            "remote_policy": ["remote_policy", "extracted_job_info.remote", "researched_data.remote_policy"],
+            "employee_reviews": ["employee_reviews", "researched_data.employee_reviews"],
+            "company_growth": ["company_growth", "researched_data.company_growth"],
+            "promotion_track": ["promotion_track", "researched_data.promotion_track", "career_path"],
+            "learning_opportunities": ["learning_opportunities", "professional_development", "researched_data.learning_opportunities"],
+            "company_size": ["company_size", "company_info.company_size", "researched_data.company_size"],
+            "job_responsibilities": ["job_responsibilities", "extracted_job_info.responsibilities", "researched_data.job_responsibilities"],
+            "user_career_goals": ["user_preferences.career_goals", "user_data.career_goals"],
+            "job_field": ["job_field", "industry", "field"],
+            "job_level": ["job_level", "seniority", "level"],
+            "team_structure": ["team_structure", "researched_data.team_structure"],
+            "manager_info": ["manager_info", "researched_data.manager_info"],
+            "interview_feedback": ["interview_feedback", "interview_notes"],
+            "management_style": ["management_style", "researched_data.management_style"],
+            "company_values": ["company_values", "researched_data.company_values"],
+            "user_preferences": ["user_preferences"],
+            "workplace_style": ["workplace_style", "researched_data.workplace_style"],
+            "job_location": ["location", "job_location"],
+            "commute_info": ["commute_info", "researched_data.commute_info"],
+            "user_location": ["user_location", "user_preferences.location", "user_data.location"],
+            "industry_comp_data": ["industry_comp_data", "researched_data.industry_comp_data"]
+        }
+        
+        # Look for information in all possible paths
+        if info_key in info_paths:
+            for path in info_paths[info_key]:
+                # Handle nested paths
+                if "." in path:
+                    parts = path.split(".")
+                    current = application_data
+                    found = True
+                    for part in parts:
+                        if part not in current:
+                            found = False
+                            break
+                        current = current[part]
+                    
+                    if found and current:  # Make sure it's not None or empty
+                        return True
+                # Simple paths
+                elif path in application_data and application_data[path]:
+                    return True
+        
+        # Special case: If the info_key itself is in application_data
+        if info_key in application_data and application_data[info_key]:
+            return True
+            
+        # Special case: If the info_key is in researched_data
+        if "researched_data" in application_data and info_key in application_data["researched_data"]:
+            return True
+        
+        return False
+    
     def assess_job_quality(self, 
                           application_data: Dict, 
-                          user_preferences: Dict) -> Dict:
+                          user_preferences: Dict,
+                          knowledge_gaps: Optional[Dict] = None) -> Dict:
         """
-        Assess job quality metrics using direct reasoning.
+        Assess job quality metrics using direct reasoning and dynamic research.
         
         Args:
             application_data: Enriched application data
             user_preferences: User preference variables
+            knowledge_gaps: Optional pre-identified knowledge gaps
             
         Returns:
             Dictionary of job quality metrics with scores and reasoning
@@ -425,6 +1613,33 @@ class JobQualityAssessmentAgent:
         if self.verbose:
             self._display_assessment_header(application_data, user_preferences)
         
+        # Create a working copy of the application data
+        working_data = application_data.copy()
+        
+        # Initialize researched_data if not present
+        if "researched_data" not in working_data:
+            working_data["researched_data"] = {}
+        
+        # Identify knowledge gaps if not provided
+        metrics_to_assess = [metric_dict["key"] for metric_dict in self.config.standard_metrics]
+        
+        if knowledge_gaps is None:
+            knowledge_gaps = self.identify_knowledge_gaps(metrics_to_assess, working_data)
+        
+        # Only conduct research if we have gaps to fill
+        if knowledge_gaps:
+            print("\n🔍 CONDUCTING RESEARCH TO FILL KNOWLEDGE GAPS")
+            
+            # Research all identified gaps
+            research_results = self.research_agent.research_all_gaps(working_data, knowledge_gaps)
+            
+            # Add research results to the working data
+            if research_results:
+                for key, value in research_results.items():
+                    working_data["researched_data"][key] = value
+                
+                print(f"✅ Added {len(research_results)} new findings to the assessment data")
+        
         # Assess each standard metric
         for metric_dict in self.config.standard_metrics:
             metric_key = metric_dict["key"]
@@ -434,7 +1649,7 @@ class JobQualityAssessmentAgent:
             # Evaluate the metric with direct reasoning
             score, confidence, reasoning_steps = self._evaluate_metric(
                 metric_key=metric_key,
-                application_data=application_data,
+                application_data=working_data,
                 user_preferences=user_preferences
             )
             
@@ -506,16 +1721,17 @@ class JobQualityAssessmentAgent:
         return {
             "metrics": job_quality_metrics,
             "reasoning_traces": reasoning_traces,
-            "assessment_date": datetime.now().isoformat()
+            "assessment_date": datetime.now().isoformat(),
+            "researched_data": working_data.get("researched_data", {})
         }
     
     def _evaluate_metric(self, metric_key: str, application_data: Dict, user_preferences: Dict) -> Tuple[float, float, List[Dict]]:
         """
-        Evaluate a job quality metric using direct reasoning.
+        Evaluate a job quality metric using direct reasoning with research-enhanced data.
         
         Args:
             metric_key: The key of the metric to evaluate
-            application_data: Enriched application data
+            application_data: Enriched application data with research
             user_preferences: User preference variables
             
         Returns:
@@ -547,6 +1763,17 @@ class JobQualityAssessmentAgent:
                     previous_reasoning += f"Attempt {i+1}: {step['reasoning']}\n"
                     previous_reasoning += f"Score: {step['score']}/10, Confidence: {step['confidence']}\n\n"
             
+            # Identify which pieces of researched data are relevant for this metric
+            relevant_research = self._get_relevant_research(metric_key, application_data)
+            research_context = ""
+            if relevant_research:
+                research_context = "Additional researched information:\n"
+                for key, value in relevant_research.items():
+                    if isinstance(value, dict) and "data" in value:
+                        research_context += f"{key}: {value['data']}\n\n"
+                    else:
+                        research_context += f"{key}: {value}\n\n"
+            
             # Create a prompt for this reasoning step
             prompt = f"""
             Evaluate the {metric['name']} ({metric['description']}) for this job application.
@@ -554,10 +1781,12 @@ class JobQualityAssessmentAgent:
             Application details:
             Company: {application_data.get('company', 'Unknown')}
             Position: {application_data.get('position', 'Unknown')}
-            Description: {application_data.get('description', 'No description available')}
+            Description: {application_data.get('description', 'No description available')[:500]}...
             Salary information: {application_data.get('salary', 'Not specified')}
             Location: {application_data.get('location', 'Not specified')}
             Notes: {application_data.get('notes', '')}
+            
+            {research_context}
             
             User preferences:
             {json.dumps(user_preferences, indent=2)}
@@ -565,6 +1794,7 @@ class JobQualityAssessmentAgent:
             {previous_reasoning}
             
             Provide a detailed evaluation of this metric. Consider multiple factors in your reasoning.
+            Explicitly state what information you're using and how it impacts your assessment.
             
             Output format:
             Reasoning: [your detailed analysis]
@@ -610,11 +1840,18 @@ class JobQualityAssessmentAgent:
                     except ValueError:
                         pass
                 
+                # Boost confidence based on research
+                if relevant_research:
+                    # The more research we have, the higher the confidence
+                    research_boost = min(0.2, 0.05 * len(relevant_research))
+                    confidence = min(1.0, confidence + research_boost)
+                    
                 # Store this reasoning step
                 reasoning_steps.append({
                     "reasoning": reasoning,
                     "score": score,
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "research_used": bool(relevant_research)
                 })
                 
                 # Update current score
@@ -654,6 +1891,37 @@ class JobQualityAssessmentAgent:
         # Fallback
         return current_score or 5.0, confidence, reasoning_steps
     
+    def _get_relevant_research(self, metric_key: str, application_data: Dict) -> Dict:
+        """
+        Get research data relevant to this metric
+        
+        Args:
+            metric_key: The metric being evaluated
+            application_data: Enriched application data with research
+            
+        Returns:
+            Dictionary of relevant research findings
+        """
+        if "researched_data" not in application_data:
+            return {}
+            
+        researched_data = application_data["researched_data"]
+        
+        # Get required info for this metric
+        metric = self.config.get_metric(metric_key)
+        if not metric or "required_info" not in metric:
+            return {}
+            
+        required_info = metric["required_info"]
+        
+        # Get all research relevant to the required info
+        relevant_research = {}
+        for key in required_info:
+            if key in researched_data:
+                relevant_research[key] = researched_data[key]
+                
+        return relevant_research
+    
     def _generate_reasoning_summary(self, reasoning_steps: List[Dict]) -> str:
         """Generate a concise summary of the reasoning process"""
         if not reasoning_steps:
@@ -683,6 +1951,10 @@ class JobQualityAssessmentAgent:
             # Add score progression if multiple steps
             if len(reasoning_steps) > 1:
                 summary += f" Score progressed from {scores[0]:.1f} to {scores[-1]:.1f} across {len(reasoning_steps)} reasoning steps."
+            
+            # Mention if research was used
+            if any(step.get("research_used", False) for step in reasoning_steps):
+                summary += " Assessment includes data from focused research."
             
             return summary
         except Exception as e:
@@ -912,15 +2184,23 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
         
         # Initialize agents
         self.email_parser = EmailParserAgent(meta_agent.ai_model)
-        self.web_scraper = WebScraperAgent(meta_agent.ai_model)
-        self.data_enrichment = DataEnrichmentAgent(
+        
+        # Create research agent first to be shared
+        self.research_agent = DynamicResearchAgent(
             ai_model=meta_agent.ai_model,
-            web_scraper=self.web_scraper,
             meta_agent=meta_agent
         )
+        
+        self.data_enrichment = DataEnrichmentAgent(
+            ai_model=meta_agent.ai_model,
+            research_agent=self.research_agent,
+            meta_agent=meta_agent
+        )
+        
         self.job_quality = JobQualityAssessmentAgent(
             ai_model=meta_agent.ai_model,
             config=config,
+            research_agent=self.research_agent,
             meta_agent=meta_agent
         )
         
@@ -969,15 +2249,21 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
             enriched_data = state["enriched_data"]
             user_preferences = state["user_preferences"]
             
+            # Identify knowledge gaps
+            metrics_to_assess = [metric_dict["key"] for metric_dict in self.config.standard_metrics]
+            knowledge_gaps = self.job_quality.identify_knowledge_gaps(metrics_to_assess, enriched_data)
+            
             # Assess job quality
             assessment_result = self.job_quality.assess_job_quality(
                 application_data=enriched_data,
-                user_preferences=user_preferences
+                user_preferences=user_preferences,
+                knowledge_gaps=knowledge_gaps
             )
             
             return {
                 "job_quality_metrics": assessment_result["metrics"],
-                "reasoning_traces": assessment_result["reasoning_traces"]
+                "reasoning_traces": assessment_result["reasoning_traces"],
+                "researched_data": assessment_result.get("researched_data", {})
             }
         
         def store_assessment_results(state: ApplicationState) -> dict:
@@ -993,6 +2279,7 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                     "job_quality_metrics": state["job_quality_metrics"],
                     "user_preferences": state["user_preferences"],
                     "reasoning_traces": state["reasoning_traces"],
+                    "researched_data": state.get("researched_data", {}),
                     "assessment_date": datetime.now().isoformat(),
                     "api_stats": {
                         "total_calls": self.meta_agent.total_calls if self.meta_agent else 0
@@ -1053,7 +2340,8 @@ def setup_application_processing(automated=True):
         workflow_id="application_processing",
         storage_collection="job_applications",
         confidence_threshold=0.7,
-        max_reasoning_attempts=3
+        max_reasoning_attempts=3,
+        max_research_attempts=2  # New: limit research attempts
     )
 
     # Initialize components
@@ -1066,7 +2354,7 @@ def setup_application_processing(automated=True):
     # Import the required classes
     from main import RateLimitedAPI, MetaReasoningAgent, AutomatedMetaReasoningAgent, MongoDBStorage
     
-    ai_model = RateLimitedAPI(model, min_delay=2.0, max_delay=10.0)
+    ai_model = RateLimitedAPI(model, min_delay=0.5, max_delay=10.0)
     
     # Use the appropriate meta agent based on the automated flag
     if automated:
@@ -1116,6 +2404,7 @@ def process_application(application_data, user_preferences, automated=True):
         "workflow_id": config.workflow_id,
         "application_data": application_data,
         "user_preferences": user_preferences,
+        "knowledge_gaps": {},  # Initialize empty knowledge gaps
         "meta_data": {"source": "api", "automated": automated}
     }
     
@@ -1210,3 +2499,16 @@ if __name__ == "__main__":
             if key != "overall_score":
                 print(f"\n✓ {metric['name']}: {metric['score']:.1f}/10")
                 print(f"  {metric['reasoning_summary']}")
+
+        # Show research findings
+        if "researched_data" in assessment_result:
+            print("\n🔍 RESEARCH FINDINGS:")
+            research = assessment_result["researched_data"]
+            for key, value in research.items():
+                if isinstance(value, dict) and "data" in value:
+                    print(f"\n📌 {key}:")
+                    if isinstance(value["data"], dict):
+                        for k, v in value["data"].items():
+                            print(f"  - {k}: {v}")
+                    else:
+                        print(f"  {value['data']}")

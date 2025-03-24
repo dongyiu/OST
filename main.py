@@ -1151,7 +1151,7 @@ def setup_resume_workflow():
     
     # Configure AI model (replace with your API key)
     model = genai.GenerativeModel("gemini-1.5-flash")
-    ai_model = RateLimitedAPI(model, min_delay=2.0, max_delay=10.0)
+    ai_model = RateLimitedAPI(model, min_delay=0.5, max_delay=10.0)
     
     meta_agent = AutomatedMetaReasoningAgent(
         ai_model=ai_model,
