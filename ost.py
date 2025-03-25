@@ -4,6 +4,180 @@ import datetime
 import math
 from typing import Dict, List, Any, Tuple, Optional, Callable
 from scipy.stats import beta, norm
+import pymongo
+import os
+from dotenv import load_dotenv
+
+# ===========================================================================
+# 0. MONGODB CONNECTION UTILITY
+# ===========================================================================
+
+class MongoDBUtility:
+    """Utility class for interacting with MongoDB, including loading and saving data."""
+    
+    def __init__(self):
+        """Initialize MongoDB connection."""
+        # Load environment variables
+        load_dotenv()
+        
+        # Get MongoDB connection string from environment variable
+        mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+        
+        try:
+            # Initialize MongoDB client
+            self.client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            # Test connection
+            self.client.server_info()
+            self.connected = True
+            
+            # Select database
+            self.db = self.client["ost_db"]
+            print("Successfully connected to MongoDB")
+        except pymongo.errors.ServerSelectionTimeoutError:
+            print("Warning: Could not connect to MongoDB. Using default values.")
+            self.connected = False
+    
+    def load_data(self, collection_name, filter_query=None, default_data=None):
+        """
+        Load data from MongoDB collection.
+        
+        Args:
+            collection_name: Name of the collection
+            filter_query: Optional query to filter results
+            default_data: Default data to return if query returns no results or to save if collection is empty
+            
+        Returns:
+            The data from MongoDB or default_data if not connected
+        """
+        # If not connected to MongoDB, return default data
+        if not hasattr(self, 'connected') or not self.connected:
+            return default_data
+            
+        try:
+            collection = self.db[collection_name]
+            
+            # Check if collection exists and has data
+            if collection.count_documents({}) == 0 and default_data:
+                if isinstance(default_data, list):
+                    # Insert list of documents
+                    collection.insert_many(default_data)
+                elif isinstance(default_data, dict):
+                    # Insert single document
+                    collection.insert_one(default_data)
+                
+                print(f"Initialized {collection_name} collection with default data")
+            
+            # Query data
+            if filter_query:
+                data = collection.find_one(filter_query)
+                if data:
+                    # Remove MongoDB _id field
+                    if '_id' in data:
+                        del data['_id']
+            else:
+                data = list(collection.find({}, {"_id": 0}))
+                
+                # If only one document and default_data is a dictionary, return that document
+                if len(data) == 1 and isinstance(default_data, dict):
+                    data = data[0]
+            
+            return data
+        except Exception as e:
+            print(f"Error accessing MongoDB collection {collection_name}: {str(e)}")
+            return default_data
+    
+    def load_dict_with_defaults(self, collection_name, default_dict, id_field="name"):
+        """
+        Load a dictionary from MongoDB, saving defaults if they don't exist.
+        
+        Args:
+            collection_name: Name of the collection
+            default_dict: Default dictionary to use if collection is empty
+            id_field: Field to use as the unique identifier
+            
+        Returns:
+            Dictionary with data from MongoDB or default_dict if not connected
+        """
+        # If not connected to MongoDB, return default dictionary
+        if not hasattr(self, 'connected') or not self.connected:
+            return default_dict
+            
+        try:
+            collection = self.db[collection_name]
+            result_dict = {}
+            
+            # Check if collection exists and has data
+            if collection.count_documents({}) == 0:
+                # Convert dictionary to list of documents
+                documents = []
+                for key, value in default_dict.items():
+                    # Convert objects to dictionaries if needed
+                    if hasattr(value, '__dict__'):
+                        doc = value.__dict__.copy()
+                    else:
+                        doc = value
+                    
+                    # Add dictionary key as id_field
+                    if id_field not in doc:
+                        doc[id_field] = key
+                        
+                    documents.append(doc)
+                
+                # Insert all documents
+                if documents:
+                    collection.insert_many(documents)
+                
+                print(f"Initialized {collection_name} collection with {len(documents)} documents")
+                return default_dict
+            
+            # Query all documents
+            documents = list(collection.find({}, {"_id": 0}))
+            
+            # Convert back to dictionary
+            for doc in documents:
+                key = doc.get(id_field)
+                if key:
+                    # Convert back to object if original was an object
+                    if key in default_dict and hasattr(default_dict[key], '__dict__'):
+                        obj = default_dict[key].__class__(**doc)
+                        result_dict[key] = obj
+                    else:
+                        result_dict[key] = doc
+            
+            return result_dict
+        except Exception as e:
+            print(f"Error loading dictionary from MongoDB collection {collection_name}: {str(e)}")
+            return default_dict
+    
+    def save_document(self, collection_name, document, filter_query=None):
+        """
+        Save a document to MongoDB, updating if it exists.
+        
+        Args:
+            collection_name: Name of the collection
+            document: The document to save
+            filter_query: Query to find existing document to update
+            
+        Returns:
+            Result of the save operation or None if not connected
+        """
+        # If not connected to MongoDB, return None
+        if not hasattr(self, 'connected') or not self.connected:
+            return None
+            
+        try:
+            collection = self.db[collection_name]
+            
+            if filter_query:
+                return collection.update_one(filter_query, {"$set": document}, upsert=True)
+            else:
+                return collection.insert_one(document)
+        except Exception as e:
+            print(f"Error saving document to MongoDB collection {collection_name}: {str(e)}")
+            return None
+
+# Initialize MongoDB utility
+mongodb_util = MongoDBUtility()
 
 # ===========================================================================
 # 1. SEMANTIC VARIABLE FRAMEWORK
@@ -44,8 +218,8 @@ class VariableType:
         return f"VariableType({self.name}, {self.var_type}, {'↑' if self.higher_is_better else '↓'})"
 
 
-# Define standard variable types
-VARIABLE_TYPES = {
+# Define default variable types for initialization
+DEFAULT_VARIABLE_TYPES = {
     # Monetary variables
     "base_salary": VariableType(
         name="base_salary",
@@ -145,6 +319,9 @@ VARIABLE_TYPES = {
     )
 }
 
+# Load variable types from MongoDB
+VARIABLE_TYPES = mongodb_util.load_dict_with_defaults("variable_types", DEFAULT_VARIABLE_TYPES)
+
 # ===========================================================================
 # 2. CONTEXT SYSTEM
 # ===========================================================================
@@ -157,8 +334,8 @@ class ContextSystem:
     
     def __init__(self):
         """Initialize with context definitions."""
-        # Field-specific context information
-        self.field_contexts = {
+        # Define default field-specific context information
+        default_field_contexts = {
             "software_engineering": {
                 "base_salary": {"median": 120000, "std_dev": 30000},
                 "remote_work": {"importance_factor": 1.5},
@@ -190,8 +367,8 @@ class ContextSystem:
             }
         }
         
-        # Experience level modifiers
-        self.experience_contexts = {
+        # Define default experience level modifiers
+        default_experience_contexts = {
             "entry": {
                 "salary_modifier": 0.7,
                 "career_growth_importance": 1.6,
@@ -214,8 +391,8 @@ class ContextSystem:
             }
         }
         
-        # Location-based cost of living adjustments
-        self.location_contexts = {
+        # Define default location-based cost of living adjustments
+        default_location_contexts = {
             "san_francisco": {"cost_modifier": 1.5},
             "new_york": {"cost_modifier": 1.4},
             "seattle": {"cost_modifier": 1.3},
@@ -224,9 +401,8 @@ class ContextSystem:
             "other": {"cost_modifier": 1.0}
         }
         
-        # Define the variable interaction matrix - which variables affect others
-        # This is a more general and flexible approach than hardcoded relationship functions
-        self.variable_interactions = {
+        # Define default variable interaction matrix
+        default_variable_interactions = {
             # Format: "influencing_var": {"affected_var": weight_modifier}
             "work_life_balance": {"base_salary": 0.15, "total_compensation": 0.12},
             "remote_work": {"base_salary": 0.12, "commute_time": 0.8},
@@ -236,8 +412,8 @@ class ContextSystem:
             "tech_stack_alignment": {"career_growth": 0.2}
         }
         
-        # Define common "would accept lower X for better Y" preferences
-        self.common_tradeoffs = {
+        # Define default common "would accept lower X for better Y" preferences
+        default_common_tradeoffs = {
             "software_engineering": [
                 ("remote_work", "base_salary", 0.15),  # Would accept 15% less salary for remote work
                 ("work_life_balance", "base_salary", 0.2),  # Would accept 20% less salary for better WLB
@@ -252,6 +428,13 @@ class ContextSystem:
                 ("career_growth", "base_salary", 0.1)
             ]
         }
+        
+        # Load data from MongoDB, using defaults if they don't exist
+        self.field_contexts = mongodb_util.load_data("field_contexts", default_data=default_field_contexts)
+        self.experience_contexts = mongodb_util.load_data("experience_contexts", default_data=default_experience_contexts)
+        self.location_contexts = mongodb_util.load_data("location_contexts", default_data=default_location_contexts)
+        self.variable_interactions = mongodb_util.load_data("variable_interactions", default_data=default_variable_interactions)
+        self.common_tradeoffs = mongodb_util.load_data("common_tradeoffs", default_data=default_common_tradeoffs)
     
     def get_context(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -761,13 +944,18 @@ class EnhancedBayesianModel:
         self.num_offers = 0
         self.num_rejections = 0
         
-        # Seasonality model
-        self.seasonality_factors = [
+        # Define default seasonality model
+        default_seasonality_factors = [
             1.05, 1.08, 1.10, 1.05,  # Q1
             0.98, 0.95, 0.92, 0.90,  # Q2
             0.88, 0.90, 0.93, 0.95,  # Q3
             1.02, 1.08, 1.12, 1.10,  # Q4
         ]
+        
+        # Load seasonality factors from MongoDB
+        seasonality_data = mongodb_util.load_data("seasonality_factors", 
+                                              default_data={"factors": default_seasonality_factors})
+        self.seasonality_factors = seasonality_data.get("factors", default_seasonality_factors)
     
     def update_with_offer(self, offer: Dict[str, Any], was_accepted: bool = None):
         """
@@ -1020,7 +1208,8 @@ class EnhancedBayesianModel:
         # Generate company and position appropriate for the field
         field = self.user_profile.get("field", "general")
         
-        field_companies = {
+        # Define default field companies
+        default_field_companies = {
             "software_engineering": [
                 "TechInnovate", "CodeCraft", "ByteBuilders", "CloudCore", "AIVentures"
             ],
@@ -1038,7 +1227,8 @@ class EnhancedBayesianModel:
             ]
         }
         
-        field_positions = {
+        # Define default field positions
+        default_field_positions = {
             "software_engineering": [
                 "Software Engineer", "Frontend Developer", "Backend Developer", 
                 "DevOps Engineer", "Full Stack Developer"
@@ -1061,6 +1251,18 @@ class EnhancedBayesianModel:
             ]
         }
         
+        # Define default offer quality weights
+        default_offer_quality_weights = {
+            "good": 0.3,  # 30% good
+            "mixed": 0.5, # 50% mixed
+            "bad": 0.2    # 20% bad
+        }
+        
+        # Load data from MongoDB
+        field_companies = mongodb_util.load_data("field_companies", default_data=default_field_companies)
+        field_positions = mongodb_util.load_data("field_positions", default_data=default_field_positions)
+        offer_quality_weights = mongodb_util.load_data("offer_quality_weights", default_data=default_offer_quality_weights)
+        
         # Get companies and positions for this field (or fall back to general)
         companies = field_companies.get(field, field_companies["general"])
         positions = field_positions.get(field, field_positions["general"])
@@ -1082,10 +1284,10 @@ class EnhancedBayesianModel:
             "total_compensation": base_salary * (1 + random.uniform(0.1, 0.3))
         }
         
-        # Decide offer quality profile
+        # Decide offer quality profile using weights from MongoDB
         offer_quality = random.choices(
-            ["good", "mixed", "bad"], 
-            weights=[0.3, 0.5, 0.2]  # 30% good, 50% mixed, 20% bad
+            list(offer_quality_weights.keys()),
+            weights=list(offer_quality_weights.values())
         )[0]
         
         # Add attributes based on semantic understanding
@@ -1192,21 +1394,35 @@ class SemanticOST:
         self.job_search_urgency = user_preferences.get('job_search_urgency', 5) / 10  # Normalize to 0-1
         self.employment_status = user_profile.get('employment_status', 'employed')
         
-        # Financial parameters
-        self.discount_rate = 0.05  # Annual discount rate
-        # MODIFICATION 3: Reduce search costs
-        self.search_cost_rate = self.current_salary * 0.02  # Base cost of searching (was 0.05)
-        self.offer_arrival_rate = 12  # Expected offers per year
+        # Default financial parameters
+        default_financial_params = {
+            "discount_rate": 0.05,  # Annual discount rate
+            "search_cost_multiplier": 0.02,  # Base cost of searching as percentage of current salary
+            "offer_arrival_rate": 12,  # Expected offers per year
+            "unemployed_search_cost_multiplier": 0.1,  # Higher opportunity cost when unemployed
+            "unemployed_discount_rate": 0.1,  # Higher time pressure when unemployed
+            "interview_cost_multiplier": 0.005,  # Cost per interview as percentage of current salary
+            "rejection_cost_multiplier": 0.001,  # Reputation cost of rejecting an offer
+            "fatigue_factor": 1.0  # Increases with each interview
+        }
+        
+        # Load financial parameters from MongoDB
+        financial_params = mongodb_util.load_data("financial_parameters", default_data=default_financial_params)
+        
+        # Set financial parameters
+        self.discount_rate = financial_params.get("discount_rate", 0.05)
+        self.search_cost_rate = self.current_salary * financial_params.get("search_cost_multiplier", 0.02)
+        self.offer_arrival_rate = financial_params.get("offer_arrival_rate", 12)
         
         # Adjust parameters based on employment status
         if self.employment_status == 'unemployed':
-            self.search_cost_rate = self.min_salary * 0.1  # Higher opportunity cost when unemployed
-            self.discount_rate = 0.1  # Higher time pressure
+            self.search_cost_rate = self.min_salary * financial_params.get("unemployed_search_cost_multiplier", 0.1)
+            self.discount_rate = financial_params.get("unemployed_discount_rate", 0.1)
         
         # Transaction costs (with semantic understanding)
-        self.interview_cost = 0.005 * self.current_salary  # Cost per interview (time, preparation)
-        self.rejection_cost = 0.001 * self.current_salary  # Reputation cost of rejecting an offer
-        self.fatigue_factor = 1.0  # Increases with each interview
+        self.interview_cost = financial_params.get("interview_cost_multiplier", 0.005) * self.current_salary
+        self.rejection_cost = financial_params.get("rejection_cost_multiplier", 0.001) * self.current_salary
+        self.fatigue_factor = financial_params.get("fatigue_factor", 1.0)
         
         # State variables
         self.current_time = 0.0
@@ -1344,12 +1560,18 @@ class SemanticOST:
         market_condition = self.belief_model.get_market_condition(t)
         field = self.user_profile.get('field', 'general')
         
-        # Field-specific arrival rate adjustments
-        field_factor = 1.0
-        if field == 'software_engineering':
-            field_factor = 1.2  # More opportunities in tech
-        elif field == 'finance':
-            field_factor = 0.9  # More competitive, fewer offers
+        # Default field-specific arrival rate adjustments
+        default_field_factors = {
+            "software_engineering": 1.2,  # More opportunities in tech
+            "finance": 0.9,  # More competitive, fewer offers
+            "general": 1.0  # Default
+        }
+        
+        # Load field factors from MongoDB
+        field_factors = mongodb_util.load_data("field_arrival_rate_factors", default_data=default_field_factors)
+        
+        # Get field factor
+        field_factor = field_factors.get(field, field_factors.get("general", 1.0))
         
         # Final arrival probability
         adjusted_arrival_prob = base_arrival_prob * market_condition * field_factor
@@ -1684,7 +1906,7 @@ class SemanticOST:
         # Expected time with field-specific considerations
         expected_time = self._estimate_time_to_acceptable_offer()
         
-        return {
+        insights = {
             "current_time": t,
             "market_condition": market_condition,
             "expected_salary_range": adjusted_range,
@@ -1698,6 +1920,50 @@ class SemanticOST:
             "estimated_time_remaining": expected_time,
             "financial_runway_remaining": max(0, self.financial_runway - t)
         }
+        
+        # Save insights to MongoDB for analytics
+        insights_to_save = insights.copy()
+        # Convert tuple to list for MongoDB (can't store tuples)
+        if "expected_salary_range" in insights_to_save:
+            insights_to_save["expected_salary_range"] = list(insights_to_save["expected_salary_range"])
+        mongodb_util.save_document("search_insights", 
+                                  {"insights": insights_to_save, 
+                                   "timestamp": datetime.datetime.now(),
+                                   "field": field,
+                                   "experience_level": experience})
+        
+        return insights
+    
+    def save_user_feedback(self, offer: Dict[str, Any], accepted: bool, user_rating: float = None, feedback: str = None):
+        """
+        Save user feedback about an offer and decision to MongoDB for model improvement.
+        
+        Args:
+            offer: The job offer data
+            accepted: Whether the offer was accepted
+            user_rating: Optional user rating of the decision (1-10)
+            feedback: Optional text feedback
+        """
+        # Create feedback document
+        feedback_doc = {
+            "offer": offer,
+            "accepted": accepted,
+            "model_utility": self.calculate_offer_utility(offer),
+            "timestamp": datetime.datetime.now(),
+            "field": self.user_profile.get("field", "general"),
+            "experience_level": self.user_profile.get("experience_level", "mid"),
+            "employment_status": self.user_profile.get("employment_status", "employed")
+        }
+        
+        # Add optional fields if provided
+        if user_rating is not None:
+            feedback_doc["user_rating"] = user_rating
+        
+        if feedback:
+            feedback_doc["feedback_text"] = feedback
+        
+        # Save to MongoDB
+        mongodb_util.save_document("user_feedback", feedback_doc)
     
     def _estimate_time_to_acceptable_offer(self) -> float:
         """Estimate time to acceptable offer with semantic understanding."""
@@ -1717,14 +1983,19 @@ class SemanticOST:
         if p_acceptable <= 0.01:  # Very low chance
             return self.max_time - t  # Pessimistic estimate
             
-        # Get field-specific arrival rate
-        field = self.user_profile.get('field', 'general')
-        field_arrival_factor = 1.0
+        # Default field-specific arrival rate factors
+        default_field_arrival_factors = {
+            "software_engineering": 1.2,  # More opportunities in tech
+            "academic": 0.7,  # Fewer opportunities in academia
+            "general": 1.0  # Default
+        }
         
-        if field == 'software_engineering':
-            field_arrival_factor = 1.2  # More opportunities
-        elif field == 'academic':
-            field_arrival_factor = 0.7  # Fewer opportunities
+        # Load field arrival factors from MongoDB
+        field_arrival_factors = mongodb_util.load_data("field_arrival_factors", default_data=default_field_arrival_factors)
+        
+        # Get field and its factor
+        field = self.user_profile.get('field', 'general')
+        field_arrival_factor = field_arrival_factors.get(field, field_arrival_factors.get("general", 1.0))
             
         # Expected time depends on field-specific arrival rate
         expected_offers_needed = 1 / p_acceptable
@@ -1740,7 +2011,8 @@ class SemanticOST:
 
 def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Create a software engineer profile for testing."""
-    user_profile = {
+    # Default SWE profile
+    default_user_profile = {
         "field": "software_engineering",
         "experience_level": "mid",
         "location": "san_francisco",
@@ -1749,13 +2021,13 @@ def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "would_accept_lower_salary_for": ["remote_work", "work_life_balance"]
     }
     
-    # MODIFICATION 2: Increase financial runway and risk tolerance
-    user_preferences = {
+    # Default SWE preferences
+    default_user_preferences = {
         "current_salary": 120000,
         "min_salary": 110000,
-        "financial_runway": 12,  # 12 months instead of 6
-        "risk_tolerance": 9,     # Higher risk tolerance (was 7)
-        "job_search_urgency": 5,  # 1-10 scale
+        "financial_runway": 12,
+        "risk_tolerance": 9,
+        "job_search_urgency": 5,
         "compensation_weight": 4,
         "career_growth_weight": 5,
         "work_life_balance_weight": 4,
@@ -1766,11 +2038,16 @@ def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "role_responsibilities_weight": 3
     }
     
+    # Load from MongoDB if available
+    user_profile = mongodb_util.load_data("swe_profile", default_data=default_user_profile)
+    user_preferences = mongodb_util.load_data("swe_preferences", default_data=default_user_preferences)
+    
     return user_profile, user_preferences
 
 def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Create a marketing professional profile for testing."""
-    user_profile = {
+    # Default marketing profile
+    default_user_profile = {
         "field": "marketing",
         "experience_level": "senior",
         "location": "new_york",
@@ -1779,13 +2056,13 @@ def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "would_accept_lower_salary_for": ["career_growth", "company_reputation"]
     }
     
-    # MODIFICATION 2: Increase financial runway and risk tolerance
-    user_preferences = {
+    # Default marketing preferences
+    default_user_preferences = {
         "current_salary": 95000,
         "min_salary": 85000,
-        "financial_runway": 12,  # 12 months instead of 3
-        "risk_tolerance": 9,     # Higher risk tolerance (was 4)
-        "job_search_urgency": 8,  # 1-10 scale
+        "financial_runway": 12,
+        "risk_tolerance": 9,
+        "job_search_urgency": 8,
         "compensation_weight": 4,
         "career_growth_weight": 5,
         "work_life_balance_weight": 3,
@@ -1793,6 +2070,10 @@ def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "remote_work_weight": 2,
         "role_responsibilities_weight": 4
     }
+    
+    # Load from MongoDB if available
+    user_profile = mongodb_util.load_data("marketing_profile", default_data=default_user_profile)
+    user_preferences = mongodb_util.load_data("marketing_preferences", default_data=default_user_preferences)
     
     return user_profile, user_preferences
 
@@ -1911,12 +2192,25 @@ def run_semantic_ost_simulation():
             print("\n=== OFFER ACCEPTED! SEARCH COMPLETE ===")
             print(f"Accepted offer from {offer['company']} at time {t:.2f} years")
             ost.observe_offer(offer, t, True)
+            
+            # Save user feedback to MongoDB
+            # Simulate a user rating of the decision (8-10 for acceptance)
+            user_rating = random.uniform(8, 10)
+            feedback = "Good match for my skills and preferences"
+            ost.save_user_feedback(offer, True, user_rating, feedback)
+            
             accepted = True
             accepted_offer = offer
             break
         
         # Update Bayesian model with rejection
         ost.observe_offer(offer, t, False)
+        
+        # Save rejection feedback to MongoDB
+        # Simulate a user rating of the decision (5-9 for rejection)
+        user_rating = random.uniform(5, 9)
+        feedback = "Didn't meet my expectations for salary and growth"
+        ost.save_user_feedback(offer, False, user_rating, feedback)
         
         # Get field-specific insights
         insights = ost.get_search_insights()
@@ -2000,6 +2294,11 @@ def run_semantic_ost_simulation():
         print(f"\nInterview fatigue factor: {ost.fatigue_factor:.2f}")
     
     print(f"Total rejections made: {ost.rejections_made}")
+    
+    # Recommend creating a .env file if MongoDB connection failed
+    if not hasattr(mongodb_util, 'connected') or not mongodb_util.connected:
+        print("\nTIP: To use MongoDB for data persistence, create a .env file with:")
+        print("MONGO_URI=your_connection_string")
 
 # Run the simulation
 if __name__ == "__main__":

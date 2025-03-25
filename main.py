@@ -13,10 +13,24 @@ import backoff
 import json
 import os
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, GoogleAPIError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 ###########################################
 # INFRASTRUCTURE LAYER
 ###########################################
+
+# Get API key from environment variables
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    print("⚠️ Warning: GEMINI_API_KEY not found in .env file")
+    print("Please create a .env file with your API key: GEMINI_API_KEY=your_api_key_here")
+    api_key = "YOUR_API_KEY_GOES_IN_ENV_FILE"
+
+# Configure Gemini API
+genai.configure(api_key=api_key)
 
 class SimpleCache:
     """
