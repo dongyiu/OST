@@ -2009,20 +2009,30 @@ class SemanticOST:
 # 6. EXAMPLE USER PROFILES FOR TESTING
 # ===========================================================================
 
-def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Create a software engineer profile for testing."""
-    # Default SWE profile
-    default_user_profile = {
+# Default profiles for different fields
+DEFAULT_FIELD_PROFILES = {
+    "software_engineering": {
         "field": "software_engineering",
         "experience_level": "mid",
         "location": "san_francisco",
         "employment_status": "employed",
         "deal_breakers": ["excessive_travel", "on_call_rotation"],
         "would_accept_lower_salary_for": ["remote_work", "work_life_balance"]
+    },
+    "marketing": {
+        "field": "marketing",
+        "experience_level": "senior",
+        "location": "new_york",
+        "employment_status": "unemployed",
+        "deal_breakers": ["toxic_culture"],
+        "would_accept_lower_salary_for": ["career_growth", "company_reputation"]
     }
-    
-    # Default SWE preferences
-    default_user_preferences = {
+}
+
+# Default preferences for different fields
+DEFAULT_FIELD_PREFERENCES = {
+    "software_engineering": {
+        "field": "software_engineering",
         "current_salary": 120000,
         "min_salary": 110000,
         "financial_runway": 12,
@@ -2036,28 +2046,9 @@ def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "tech_stack_alignment_weight": 5,
         "team_collaboration_weight": 4,
         "role_responsibilities_weight": 3
-    }
-    
-    # Load from MongoDB if available
-    user_profile = mongodb_util.load_data("swe_profile", default_data=default_user_profile)
-    user_preferences = mongodb_util.load_data("swe_preferences", default_data=default_user_preferences)
-    
-    return user_profile, user_preferences
-
-def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Create a marketing professional profile for testing."""
-    # Default marketing profile
-    default_user_profile = {
+    },
+    "marketing": {
         "field": "marketing",
-        "experience_level": "senior",
-        "location": "new_york",
-        "employment_status": "unemployed",
-        "deal_breakers": ["toxic_culture"],
-        "would_accept_lower_salary_for": ["career_growth", "company_reputation"]
-    }
-    
-    # Default marketing preferences
-    default_user_preferences = {
         "current_salary": 95000,
         "min_salary": 85000,
         "financial_runway": 12,
@@ -2070,12 +2061,80 @@ def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "remote_work_weight": 2,
         "role_responsibilities_weight": 4
     }
+}
+
+# Initialize field profiles and preferences in MongoDB
+for field, profile in DEFAULT_FIELD_PROFILES.items():
+    mongodb_util.save_document("user_profiles", profile, {"field": field})
+
+for field, preferences in DEFAULT_FIELD_PREFERENCES.items():
+    mongodb_util.save_document("user_preferences", preferences, {"field": field})
+
+def create_user_profile(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Create a user profile for any field.
     
-    # Load from MongoDB if available
-    user_profile = mongodb_util.load_data("marketing_profile", default_data=default_user_profile)
-    user_preferences = mongodb_util.load_data("marketing_preferences", default_data=default_user_preferences)
+    This function follows a dynamic approach that allows adding new fields without modifying 
+    the core code. It uses a single collection with a field indicator rather than creating 
+    separate collections for each field type.
+    
+    Args:
+        field: The professional field (e.g., "software_engineering", "marketing")
+        
+    Returns:
+        Tuple of (user_profile, user_preferences)
+    """
+    # Get fallback field (default to software_engineering if field not found)
+    fallback_field = "software_engineering"
+    
+    # Load default profile and preferences for this field
+    default_user_profile = DEFAULT_FIELD_PROFILES.get(field, DEFAULT_FIELD_PROFILES.get(fallback_field)).copy()
+    default_user_preferences = DEFAULT_FIELD_PREFERENCES.get(field, DEFAULT_FIELD_PREFERENCES.get(fallback_field)).copy()
+    
+    # Ensure field is set correctly
+    default_user_profile["field"] = field
+    default_user_preferences["field"] = field
+    
+    # Load from MongoDB if available, using field as filter
+    filter_query = {"field": field}
+    user_profile = mongodb_util.load_data("user_profiles", filter_query, default_data=default_user_profile)
+    user_preferences = mongodb_util.load_data("user_preferences", filter_query, default_data=default_user_preferences)
     
     return user_profile, user_preferences
+
+# For backward compatibility
+def create_swe_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create a software engineer profile for testing."""
+    return create_user_profile("software_engineering")
+
+def create_marketing_profile() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create a marketing professional profile for testing."""
+    return create_user_profile("marketing")
+
+def add_new_field(field_name: str, field_profile: Dict[str, Any], field_preferences: Dict[str, Any]) -> None:
+    """
+    Add a new professional field to the system with its default profile and preferences.
+    
+    This allows dynamically extending the system to support new fields without modifying code.
+    
+    Args:
+        field_name: Name of the new field (e.g., "data_science", "product_management")
+        field_profile: Default profile data for this field
+        field_preferences: Default preferences data for this field
+    """
+    # Ensure field is set in both dictionaries
+    field_profile["field"] = field_name
+    field_preferences["field"] = field_name
+    
+    # Add to DEFAULT dictionaries in memory
+    DEFAULT_FIELD_PROFILES[field_name] = field_profile
+    DEFAULT_FIELD_PREFERENCES[field_name] = field_preferences
+    
+    # Save to MongoDB
+    mongodb_util.save_document("user_profiles", field_profile, {"field": field_name})
+    mongodb_util.save_document("user_preferences", field_preferences, {"field": field_name})
+    
+    print(f"Added new field: {field_name}")
 
 # ===========================================================================
 # 7. SIMULATION DEMO
@@ -2086,14 +2145,19 @@ def run_semantic_ost_simulation():
     print("=== SEMANTIC OPTIMAL STOPPING THEORY SIMULATION ===\n")
     
     # Choose a profile
-    profile_choice = random.choice(["swe", "marketing"])
+    field_options = list(DEFAULT_FIELD_PROFILES.keys())
+    profile_choice = random.choice(field_options)
     
-    if profile_choice == "swe":
-        user_profile, user_preferences = create_swe_profile()
-        print("Using Software Engineer profile")
-    else:
-        user_profile, user_preferences = create_marketing_profile()
-        print("Using Marketing Professional profile")
+    # Create user profile using the generic function
+    user_profile, user_preferences = create_user_profile(profile_choice)
+    
+    # Determine display name for the field
+    field_display_names = {
+        "software_engineering": "Software Engineer",
+        "marketing": "Marketing Professional"
+    }
+    display_name = field_display_names.get(profile_choice, profile_choice.capitalize())
+    print(f"Using {display_name} profile")
     
     print("\nUser profile:")
     for key, value in sorted(user_profile.items()):
