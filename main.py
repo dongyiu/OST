@@ -14,6 +14,8 @@ import json
 import os
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, GoogleAPIError
 from dotenv import load_dotenv
+from ost import (MongoDBUtility, create_user_profile, DEFAULT_FIELD_PROFILES, DEFAULT_FIELD_PREFERENCES,
+                add_new_field, SemanticOST, EnhancedPreferenceProcessor)
 
 load_dotenv()
 
@@ -182,10 +184,13 @@ class MongoDBStorage(StorageInterface):
     """
     MongoDB implementation of the storage interface.
     """
-    def __init__(self, connection_string="mongodb://localhost:27017/", database_name="workflows_db"):
+    def __init__(self, connection_string="mongodb://localhost:27017/", database_name="ost_db"):
         self.connection_string = connection_string
         self.database_name = database_name
         self.client = None
+        
+        # Initialize shared MongoDB utility from ost.py
+        self.mongodb_util = MongoDBUtility()
         
     def _get_client(self):
         """Get or create MongoDB client"""
@@ -215,6 +220,141 @@ class MongoDBStorage(StorageInterface):
         except Exception as e:
             print(f"❌ MongoDB Error: {str(e)}")
             return []
+
+###########################################
+# OST INTEGRATION LAYER
+###########################################
+
+class OSTDataTransformer:
+    """
+    Utility class for transforming data between main.py and ost.py formats.
+    """
+    @staticmethod
+    def transform_user_data_to_preferences(user_data):
+        """
+        Transform user data from main.py format to ost.py preferences format.
+        
+        Args:
+            user_data: List of user data items from main.py
+                [{"question_type": "variable_name", "response": value, ...}]
+                
+        Returns:
+            Dictionary of preferences in ost.py format
+                {"variable_name": value, ...}
+        """
+        preferences = {}
+        
+        for item in user_data:
+            var_name = item["question_type"]
+            var_value = item["response"]
+            preferences[var_name] = var_value
+            
+        return preferences
+    
+    @staticmethod
+    def map_job_field_to_ost_field(job_field):
+        """
+        Map job field from main.py to ost.py field name.
+        
+        Args:
+            job_field: Job field name from main.py
+            
+        Returns:
+            Field name compatible with ost.py
+        """
+        # Common mappings between main.py job fields and ost.py fields
+        field_mappings = {
+            "software engineer": "software_engineering",
+            "software developer": "software_engineering",
+            "software development": "software_engineering",
+            "marketing": "marketing",
+            "marketing specialist": "marketing",
+            "marketing manager": "marketing",
+            # Add more mappings as needed
+        }
+        
+        # Normalize the job field (lowercase, remove extra spaces)
+        normalized_field = job_field.lower().strip()
+        
+        # Try direct match
+        if normalized_field in field_mappings:
+            return field_mappings[normalized_field]
+        
+        # Try partial match
+        for key, value in field_mappings.items():
+            if key in normalized_field or normalized_field in key:
+                return value
+        
+        # Default to software_engineering if no match is found
+        print(f"⚠️ Unknown job field '{job_field}', defaulting to software_engineering")
+        return "software_engineering"
+    
+    @staticmethod
+    def create_ost_profile_from_main_data(job_field, user_data):
+        """
+        Create a full OST user profile and preferences from main.py data.
+        
+        Args:
+            job_field: Job field extracted from resume
+            user_data: User responses from main.py
+            
+        Returns:
+            Tuple of (user_profile, user_preferences) for ost.py
+        """
+        # Map job field to OST field
+        ost_field = OSTDataTransformer.map_job_field_to_ost_field(job_field)
+        
+        # Get default profile and preferences for this field
+        user_profile, user_preferences = create_user_profile(ost_field)
+        
+        # Transform user data to preferences format
+        main_preferences = OSTDataTransformer.transform_user_data_to_preferences(user_data)
+        
+        # Update OST preferences with values from main.py
+        for key, value in main_preferences.items():
+            user_preferences[key] = value
+        
+        # Ensure required fields exist
+        expected_fields = [
+            "min_salary", "compensation_weight", "career_growth_weight", 
+            "work_life_balance_weight", "risk_tolerance", "job_search_urgency"
+        ]
+        
+        for field in expected_fields:
+            if field not in user_preferences:
+                print(f"⚠️ Missing expected field '{field}' in user preferences, using default")
+        
+        # Add/update field indicator in profile and preferences
+        user_profile["field"] = ost_field
+        user_preferences["field"] = ost_field
+        
+        return user_profile, user_preferences
+    
+    @staticmethod
+    def save_to_ost_collections(user_profile, user_preferences):
+        """
+        Save user profile and preferences to OST's MongoDB collections.
+        
+        Args:
+            user_profile: User profile data
+            user_preferences: User preferences data
+            
+        Returns:
+            Success status
+        """
+        try:
+            # Create MongoDB utility
+            mongodb_util = MongoDBUtility()
+            
+            # Save profile and preferences
+            field = user_profile.get("field", "unknown")
+            mongodb_util.save_document("user_profiles", user_profile, {"field": field})
+            mongodb_util.save_document("user_preferences", user_preferences, {"field": field})
+            
+            return True
+        except Exception as e:
+            print(f"❌ Error saving to OST collections: {str(e)}")
+            return False
 
 ###########################################
 # AGENT FRAMEWORK LAYER
@@ -617,6 +757,8 @@ class ResumeWorkflowState(BaseWorkflowState):
     job_field: str
     questions: List[dict]  # {"variable": str, "question": str}
     user_data: List[dict]  # {"question_type": str, "question": str, "response": float, "data_type": str}
+    ost_profile: Dict
+    ost_preferences: Dict
 
 
 class VariableSchema:
@@ -927,12 +1069,47 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
             print(f"\n✅ Completed with {self.meta_agent.total_calls} total API calls")
             return {"user_data": user_data}
         
+        def ost_integration(state: ResumeWorkflowState) -> dict:
+            """
+            Transform and save data in the format that OST requires.
+            Create the profile and preferences for OST.
+            """
+            try:
+                # Create OST profile and preferences from collected data
+                user_profile, user_preferences = OSTDataTransformer.create_ost_profile_from_main_data(
+                    state["job_field"], state["user_data"]
+                )
+                
+                # Save to OST collections
+                success = OSTDataTransformer.save_to_ost_collections(user_profile, user_preferences)
+                
+                if success:
+                    print("✅ Data successfully transformed and saved for OST")
+                else:
+                    print("⚠️ Warning: Could not save data to OST collections")
+                
+                # Return the created profile and preferences for future use
+                return {
+                    "ost_profile": user_profile,
+                    "ost_preferences": user_preferences
+                }
+                
+            except Exception as e:
+                print(f"❌ Error in OST integration: {str(e)}")
+                # Return empty dictionaries as fallback
+                return {
+                    "ost_profile": {},
+                    "ost_preferences": {}
+                }
+        
         def data_storage(state: ResumeWorkflowState) -> dict:
             try:
                 document = {
                     "workflow_id": self.config.workflow_id,
                     "job_field": state["job_field"],
                     "user_data": state["user_data"],
+                    "ost_profile": state.get("ost_profile", {}),
+                    "ost_preferences": state.get("ost_preferences", {}),
                     "api_stats": {
                         "total_calls": self.meta_agent.total_calls,
                         "variables_analyzed": len(self.meta_agent.reasoning_history.history)
@@ -964,6 +1141,7 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
         self.registry.register_node("job_field_extractor", job_field_extractor)
         self.registry.register_node("question_generator", question_generator)
         self.registry.register_node("dynamic_question_manager", dynamic_question_manager)
+        self.registry.register_node("ost_integration", ost_integration)
         self.registry.register_node("data_storage", data_storage)
         
         # Build the graph
@@ -972,12 +1150,14 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
         graph.add_node("job_field_extractor", job_field_extractor)
         graph.add_node("question_generator", question_generator)
         graph.add_node("dynamic_question_manager", dynamic_question_manager)
+        graph.add_node("ost_integration", ost_integration)
         graph.add_node("data_storage", data_storage)
 
         graph.add_edge("pdf_parser", "job_field_extractor")
         graph.add_edge("job_field_extractor", "question_generator")
         graph.add_edge("question_generator", "dynamic_question_manager")
-        graph.add_edge("dynamic_question_manager", "data_storage")
+        graph.add_edge("dynamic_question_manager", "ost_integration")
+        graph.add_edge("ost_integration", "data_storage")
         graph.set_entry_point("pdf_parser")
 
         return graph.compile()
@@ -1091,6 +1271,143 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
             return fallback
 
 
+class OSTWorkflowState(BaseWorkflowState):
+    """State structure for the OST job evaluation workflow"""
+    field: str
+    experience_level: str
+    job_offers: List[Dict]
+    evaluation_results: List[Dict]
+
+
+class OSTWorkflowBuilder(BaseWorkflowBuilder):
+    """
+    Builder for the OST job evaluation workflow.
+    """
+    def __init__(self, 
+                 registry: WorkflowRegistry,
+                 meta_agent: Optional[MetaReasoningAgent] = None,
+                 storage: Optional[StorageInterface] = None,
+                 max_offers: int = 10):
+        super().__init__(registry, meta_agent, storage)
+        self.max_offers = max_offers
+        
+    def build_graph(self) -> StateGraph:
+        """Build the OST workflow graph"""
+        
+        def load_user_data(state: OSTWorkflowState) -> dict:
+            """Load user profile and preferences from OST system"""
+            try:
+                user_profile, user_preferences = create_user_profile(state["field"])
+                
+                return {
+                    "user_profile": user_profile,
+                    "user_preferences": user_preferences
+                }
+            except Exception as e:
+                print(f"❌ Error loading user data: {str(e)}")
+                return {
+                    "user_profile": DEFAULT_FIELD_PROFILES.get(state["field"], DEFAULT_FIELD_PROFILES["software_engineering"]),
+                    "user_preferences": DEFAULT_FIELD_PREFERENCES.get(state["field"], DEFAULT_FIELD_PREFERENCES["software_engineering"])
+                }
+        
+        def initialize_ost(state: OSTWorkflowState) -> dict:
+            """Initialize OST algorithm with user profile and preferences"""
+            try:
+                # Create preference processor and OST algorithm
+                preference_processor = EnhancedPreferenceProcessor(
+                    state["user_profile"], 
+                    state["user_preferences"]
+                )
+                
+                ost_algorithm = SemanticOST(
+                    state["user_profile"],
+                    state["user_preferences"],
+                    offer_arrival_rate=0.5,  # Adjust as needed
+                    time_horizon=30,  # 30 day horizon
+                    preference_processor=preference_processor
+                )
+                
+                return {
+                    "ost_algorithm": ost_algorithm,
+                    "preference_processor": preference_processor
+                }
+            except Exception as e:
+                print(f"❌ Error initializing OST: {str(e)}")
+                return {}
+        
+        def evaluate_job_offers(state: OSTWorkflowState) -> dict:
+            """Evaluate job offers using the OST algorithm"""
+            try:
+                evaluation_results = []
+                
+                for offer in state["job_offers"]:
+                    # Calculate offer utility
+                    utility = state["preference_processor"].calculate_offer_utility(offer)
+                    
+                    # Get threshold at current time
+                    current_time = state.get("current_time", 0)
+                    threshold = state["ost_algorithm"].get_threshold(current_time)
+                    
+                    # Determine if offer should be accepted
+                    should_accept = utility >= threshold
+                    
+                    # Add evaluation result
+                    evaluation_results.append({
+                        "offer": offer,
+                        "utility": utility,
+                        "threshold": threshold,
+                        "accept_recommendation": should_accept,
+                        "evaluation_time": current_time
+                    })
+                
+                return {"evaluation_results": evaluation_results}
+            except Exception as e:
+                print(f"❌ Error evaluating job offers: {str(e)}")
+                return {"evaluation_results": []}
+        
+        def save_evaluation_results(state: OSTWorkflowState) -> dict:
+            """Save evaluation results to storage"""
+            try:
+                document = {
+                    "workflow_id": state["workflow_id"],
+                    "field": state["field"],
+                    "evaluation_results": state["evaluation_results"],
+                    "timestamp": time.time()
+                }
+                
+                if self.storage:
+                    success = self.storage.store_data("ost_evaluations", document)
+                    if success:
+                        print("✅ Evaluation results stored successfully!")
+                    else:
+                        print("⚠️ Failed to store evaluation results")
+                
+                return {}
+            except Exception as e:
+                print(f"❌ Error saving evaluation results: {str(e)}")
+                return {}
+        
+        # Register nodes with the registry
+        self.registry.register_node("load_user_data", load_user_data)
+        self.registry.register_node("initialize_ost", initialize_ost)
+        self.registry.register_node("evaluate_job_offers", evaluate_job_offers)
+        self.registry.register_node("save_evaluation_results", save_evaluation_results)
+        
+        # Build the graph
+        graph = StateGraph(OSTWorkflowState)
+        graph.add_node("load_user_data", load_user_data)
+        graph.add_node("initialize_ost", initialize_ost)
+        graph.add_node("evaluate_job_offers", evaluate_job_offers)
+        graph.add_node("save_evaluation_results", save_evaluation_results)
+        
+        graph.add_edge("load_user_data", "initialize_ost")
+        graph.add_edge("initialize_ost", "evaluate_job_offers")
+        graph.add_edge("evaluate_job_offers", "save_evaluation_results")
+        graph.set_entry_point("load_user_data")
+        
+        return graph.compile()
+
+
 ###########################################
 # WORKFLOW EXECUTOR
 ###########################################
@@ -1138,17 +1455,19 @@ def setup_resume_workflow():
     """
     # 1. Define standard variables for resume workflow
     standard_variables = [
-        {"key": "min_salary", "type": "number", "min": 0, "max": 10000000, "description": "Minimum acceptable annual salary in USD"},
+        {"key": "min_salary", "type": "number", "min": 0, "max": 10000000, "description": "Minimum acceptable annual salary"},
         {"key": "compensation_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of compensation (1-5, 1=unimportant, 5=extremely important)"},
         {"key": "career_growth_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of career growth (1-5, 1=unimportant, 5=extremely important)"},
         {"key": "work_life_balance_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of work-life balance (1-5, 1=unimportant, 5=extremely important)"},
         {"key": "company_reputation_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of company reputation (1-5, 1=unimportant, 5=extremely important)"},
-        {"key": "location_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of location (1-5, 1=unimportant, 5=extremely important)"},
+        {"key": "remote_work_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of remote work options (1-5, 1=unimportant, 5=extremely important)"},
+        {"key": "tech_stack_alignment_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of tech stack alignment (1-5, 1=unimportant, 5=extremely important)"},
+        {"key": "team_collaboration_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of team collaboration (1-5, 1=unimportant, 5=extremely important)"},
         {"key": "role_responsibilities_weight", "type": "number", "min": 1, "max": 5, "description": "Importance of role responsibilities (1-5, 1=unimportant, 5=extremely important)"},
         {"key": "risk_tolerance", "type": "number", "min": 1, "max": 10, "description": "Willingness to wait for better offers (1-10, 1=low, 10=high)"},
         {"key": "financial_runway", "type": "number", "min": 0, "max": 120, "description": "Months you can afford to search for a job"},
         {"key": "job_search_urgency", "type": "number", "min": 1, "max": 10, "description": "Urgency to find a new job (1-10, 1=not urgent, 10=very urgent)"},
-        {"key": "current_salary", "type": "number", "min": 0, "max": 10000000, "description": "Current or last annual salary in USD"}
+        {"key": "current_salary", "type": "number", "min": 0, "max": 10000000, "description": "Current or last annual salary"}
     ]
 
     # 2. Create workflow configuration
@@ -1182,6 +1501,21 @@ def setup_resume_workflow():
     return registry, config
 
 
+def setup_ost_workflow():
+    """
+    Set up and configure the OST job evaluation workflow.
+    """
+    # 1. Initialize components
+    registry = WorkflowRegistry()
+    storage = MongoDBStorage()
+    
+    # 2. Build and register workflow
+    builder = OSTWorkflowBuilder(registry, storage=storage, max_offers=10)
+    builder.register_workflow("ost_workflow")
+    
+    return registry
+
+
 def main():
     """
     Main application entry point.
@@ -1210,6 +1544,52 @@ def main():
         print("✅ Workflow completed successfully!")
         print(f"Job field: {result.get('job_field', 'unknown')}")
         print(f"User data collected: {len(result.get('user_data', []))} variables")
+        
+        # Show OST profile created
+        if 'ost_profile' in result and result['ost_profile']:
+            print("\n📊 OST Profile created:")
+            print(f"Field: {result['ost_profile'].get('field', 'unknown')}")
+            print(f"Experience level: {result['ost_profile'].get('experience_level', 'unknown')}")
+        else:
+            print("\n⚠️ No OST Profile was created")
+
+
+def run_ost_evaluation(field, job_offers):
+    """
+    Run OST job evaluation standalone.
+    
+    Args:
+        field: The professional field
+        job_offers: List of job offers to evaluate
+    """
+    print(f"📊 Running OST evaluation for field: {field}")
+    
+    # Setup OST workflow
+    registry = setup_ost_workflow()
+    executor = WorkflowExecutor(registry)
+    
+    # Run the workflow
+    initial_state = {
+        "workflow_id": "ost_workflow",
+        "field": field,
+        "job_offers": job_offers,
+        "current_time": 0,  # Day 0 of job search
+        "meta_data": {"source": "command_line"}
+    }
+    
+    result = executor.run_workflow("ost_workflow", initial_state)
+    if result:
+        print("\n✅ OST evaluation completed successfully!")
+        print(f"Evaluated {len(result.get('evaluation_results', []))} job offers")
+        
+        # Display results
+        for i, eval_result in enumerate(result.get('evaluation_results', [])):
+            print(f"\nOffer {i+1}:")
+            print(f"Utility: {eval_result.get('utility', 0):.2f}")
+            print(f"Threshold: {eval_result.get('threshold', 0):.2f}")
+            print(f"Recommendation: {'Accept' if eval_result.get('accept_recommendation', False) else 'Reject'}")
+    else:
+        print("⚠️ OST evaluation failed")
 
 
 if __name__ == "__main__":
