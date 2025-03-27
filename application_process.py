@@ -2287,23 +2287,30 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                 researched_data = state.get("researched_data", {})
                 
                 # Extract field information
-                field = application_data.get("field", 
-                                          enriched_data.get("field", "unknown"))
+                field = application_data.get("field", enriched_data.get("field"))
+                if not field or field == "unknown":
+                    # Default to a general category if field is not available
+                    field = "general"
                 
                 # Extract position information
-                position = application_data.get("position", 
-                                             enriched_data.get("position", "unknown"))
+                position = application_data.get("position", enriched_data.get("position"))
+                if not position or position == "unknown":
+                    position = f"position_in_{field}"
                 
                 # Extract company information
-                company = application_data.get("company", 
-                                            enriched_data.get("company", "unknown"))
+                company = application_data.get("company", enriched_data.get("company"))
+                if not company or company == "unknown":
+                    company = f"company_in_{field}"
                 
                 # Extract location information
-                location = application_data.get("location", 
-                                             enriched_data.get("location", "unknown"))
+                location = application_data.get("location", enriched_data.get("location"))
+                if not location or location == "unknown":
+                    location = "remote"  # Default to remote rather than unknown
                 
                 # Extract experience level
-                experience_level = enriched_data.get("experience_level", "mid")
+                experience_level = enriched_data.get("experience_level")
+                if not experience_level or experience_level == "unknown":
+                    experience_level = "mid"  # Default to mid-level experience
                 
                 print(f"📊 Storing data for field: {field}, position: {position}")
                 
@@ -2335,53 +2342,188 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                     mongodb_util.save_document("variable_types", var_type, {"name": key})
                     
                 # 2. Update field_contexts collection with industry data
-                field_context = {
-                    "field": field
-                }
+                # Create proper structure with field as key
+                field_contexts = {}
+                
+                field_data = {}
                 
                 # Add salary data if available
                 if "salary_data" in researched_data:
                     salary_data = researched_data["salary_data"]
                     if isinstance(salary_data, dict) and "data" in salary_data:
-                        field_context["salary_data"] = salary_data["data"]
+                        field_data["salary_data"] = salary_data["data"]
                         
                 # Add base salary info if available in metrics
                 if "base_salary" in job_quality_metrics:
                     base_salary = job_quality_metrics["base_salary"]
                     if isinstance(base_salary, (int, float)):
                         # Store actual value if numeric, or extract from text
-                        field_context["base_salary"] = {"median": base_salary, "std_dev": base_salary * 0.15}
+                        field_data["base_salary"] = {"median": base_salary, "std_dev": base_salary * 0.15}
                 
-                # Store field context
-                mongodb_util.save_document("field_contexts", field_context, {"field": field})
+                # Set the field data in the contexts dictionary
+                field_contexts[field] = field_data
+                
+                # Always include a general field for fallback
+                if field != "general":
+                    field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+                
+                # Insert as a new document
+                mongodb_util.db["field_contexts"].insert_one(field_contexts)
                 
                 # 3. Update experience_contexts collection
-                experience_context = {
-                    "level": experience_level
-                }
+                # Create proper structure with level as key
+                experience_contexts = {}
+                
+                # Create data for this experience level
+                level_data = {}
+                
+                # Use AI model to generate appropriate experience level factors
+                prompt = f"""
+                Generate experience level factors for a {experience_level} role in {field}. 
+                
+                Include the following data points:
+                1. salary_modifier - A multiplier for base salary (e.g., 1.0 for mid-level)
+                2. career_growth_importance - How important career growth is at this level (e.g., 1.2 for mid-level)
+                3. company_reputation_importance - How important company reputation is at this level (e.g., 1.0 for mid-level)
+                
+                Format as JSON with these three keys and numeric values.
+                """
+                
+                try:
+                    # Generate experience level factors using the AI model
+                    response = self.meta_agent.ai_model.generate_content(prompt)
+                    experience_factors_json = response.text
+                    
+                    # Track API usage
+                    if hasattr(self.meta_agent, 'increment'):
+                        self.meta_agent.increment()
+                except Exception as e:
+                    print(f"❌ Error generating experience factors: {str(e)}")
+                    experience_factors_json = "{}"
+                
+                # Parse the JSON response
+                try:
+                    import json
+                    import re
+                    
+                    # Extract JSON if it's embedded in text
+                    json_match = re.search(r'\{[^}]*\}', experience_factors_json)
+                    if json_match:
+                        experience_factors = json.loads(json_match.group(0))
+                    else:
+                        experience_factors = json.loads(experience_factors_json)
+                    
+                    # Update level_data with the generated factors
+                    level_data.update(experience_factors)
+                    
+                    # Ensure all required keys are present
+                    required_keys = ["salary_modifier", "career_growth_importance", "company_reputation_importance"]
+                    for key in required_keys:
+                        if key not in level_data:
+                            # If a key is missing, add a placeholder that won't break calculations
+                            if key == "salary_modifier":
+                                level_data[key] = 1.0
+                            else:
+                                level_data[key] = 1.0
+                            print(f"⚠️ Warning: AI didn't generate {key}, using default value")
+                            
+                except Exception as e:
+                    print(f"❌ Error parsing AI generated experience factors: {str(e)}")
+                    # Ensure we have minimum required fields if parsing fails
+                    level_data["salary_modifier"] = 1.0
+                    level_data["career_growth_importance"] = 1.0
+                    level_data["company_reputation_importance"] = 1.0
                 
                 # Add salary modifiers if available
                 if "salary" in enriched_data:
                     salary = enriched_data["salary"]
                     if isinstance(salary, (int, float)):
-                        experience_context["observed_salary"] = salary
+                        level_data["observed_salary"] = salary
+                
+                # Store as a key-value pair where key is the experience level
+                experience_contexts[experience_level] = level_data
+                
+                # For other experience levels, use AI to generate appropriate factors
+                standard_levels = ["entry", "junior", "mid", "senior", "lead"]
+                for level in standard_levels:
+                    if level != experience_level and level not in experience_contexts:
+                        # Generate data for this level
+                        level_prompt = f"""
+                        Generate experience level factors for a {level} role in {field}. 
                         
-                # Store experience context
-                mongodb_util.save_document("experience_contexts", experience_context, {"level": experience_level})
+                        Include the following data points:
+                        1. salary_modifier - A multiplier for base salary (e.g., 1.0 for mid-level)
+                        2. career_growth_importance - How important career growth is at this level (e.g., 1.2 for mid-level)
+                        3. company_reputation_importance - How important company reputation is at this level (e.g., 1.0 for mid-level)
+                        
+                        Format as JSON with these three keys and numeric values.
+                        """
+                        
+                        # Generate factors for this level using the AI model
+                        try:
+                            response = self.meta_agent.ai_model.generate_content(level_prompt)
+                            level_factors_json = response.text
+                            
+                            # Track API usage
+                            if hasattr(self.meta_agent, 'increment'):
+                                self.meta_agent.increment()
+                        except Exception as e:
+                            print(f"❌ Error generating experience factors for {level}: {str(e)}")
+                            level_factors_json = "{}"
+                        
+                        # Parse the JSON response
+                        try:
+                            # Extract JSON if it's embedded in text
+                            json_match = re.search(r'\{[^}]*\}', level_factors_json)
+                            if json_match:
+                                level_factors = json.loads(json_match.group(0))
+                            else:
+                                level_factors = json.loads(level_factors_json)
+                                
+                            # Ensure all required keys are present
+                            for key in required_keys:
+                                if key not in level_factors:
+                                    # If a key is missing, add a placeholder
+                                    if key == "salary_modifier":
+                                        level_factors[key] = 1.0
+                                    else:
+                                        level_factors[key] = 1.0
+                                        
+                            experience_contexts[level] = level_factors
+                            
+                        except Exception as e:
+                            print(f"❌ Error parsing AI generated factors for {level}: {str(e)}")
+                            # Provide minimum required fields if parsing fails
+                            experience_contexts[level] = {
+                                "salary_modifier": 1.0,
+                                "career_growth_importance": 1.0,
+                                "company_reputation_importance": 1.0
+                            }
+                
+                # Print for debugging
+                print(f"📊 Generated experience contexts: {experience_contexts}")
+                
+                # Insert as a new document
+                mongodb_util.db["experience_contexts"].insert_one(experience_contexts)
                 
                 # 4. Update location_contexts collection
-                location_context = {
-                    "location": location
-                }
+                # Create proper structure with location as key
+                location_contexts = {}
+                
+                # Create data for this location
+                location_data = {}
                 
                 # Add cost of living data if available
                 if "location_factor" in researched_data:
-                    location_data = researched_data["location_factor"]
-                    if isinstance(location_data, dict) and "data" in location_data:
-                        location_context["cost_data"] = location_data["data"]
-                        
-                # Store location context
-                mongodb_util.save_document("location_contexts", location_context, {"location": location})
+                    loc_factor = researched_data["location_factor"]
+                    if isinstance(loc_factor, dict) and "data" in loc_factor:
+                        location_data["cost_data"] = loc_factor["data"]
+                
+                # Store as a key-value pair where key is the location
+                location_contexts[location] = location_data
+                
+                # Insert as a new document
+                mongodb_util.db["location_contexts"].insert_one(location_contexts)
                 
                 # 5. Update variable_interactions collection
                 # Look for relationships between variables in the job quality metrics
@@ -2395,64 +2537,74 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                 # Store variable interactions
                 mongodb_util.save_document("variable_interactions", variable_interactions)
                 
-                # 6. Update common_tradeoffs collection
+                # 6. Create common_tradeoffs document using available metrics
                 tradeoffs = {}
-                tradeoffs[field] = []
                 
-                # Add common field-specific tradeoffs based on job quality metrics
-                if field == "software_engineering":
-                    tradeoffs[field] = [
-                        ("remote_work", "base_salary", 0.15),
-                        ("work_life_balance", "base_salary", 0.2),
-                        ("tech_stack_alignment", "base_salary", 0.1)
-                    ]
-                elif field == "marketing":
-                    tradeoffs[field] = [
-                        ("company_reputation", "base_salary", 0.18),
-                        ("career_growth", "base_salary", 0.15)
-                    ]
-                else:
-                    tradeoffs[field] = [
-                        ("work_life_balance", "base_salary", 0.15),
-                        ("career_growth", "base_salary", 0.1)
-                    ]
-                    
-                # Store common tradeoffs
-                mongodb_util.save_document("common_tradeoffs", tradeoffs)
+                # Get available metrics to create tradeoffs
+                available_metrics = list(job_quality_metrics.keys())
                 
-                # 7. Update seasonality_factors collection
+                # Create field-specific tradeoffs based on available metrics
+                field_tradeoffs = []
+                
+                # Create tradeoffs based on available metrics
+                if "base_salary" in available_metrics:
+                    # Find metrics to trade off with salary
+                    for metric in available_metrics:
+                        if metric != "base_salary":
+                            # Weight determined by agent analysis
+                            weight = 0.0
+                            if isinstance(job_quality_metrics[metric], dict) and "importance" in job_quality_metrics[metric]:
+                                weight = float(job_quality_metrics[metric]["importance"]) / 10.0
+                            else:
+                                # Generate a tradeoff weight based on the metric value
+                                if isinstance(job_quality_metrics[metric], (int, float)):
+                                    weight = min(0.25, max(0.05, job_quality_metrics[metric] / 100.0))
+                                else:
+                                    weight = 0.1
+                            
+                            field_tradeoffs.append([metric, "base_salary", weight])
+                
+                # Add only metrics that were analyzed
+                tradeoffs[field] = field_tradeoffs
+                
+                # Insert as a new document
+                mongodb_util.db["common_tradeoffs"].insert_one(tradeoffs)
+                
+                # 7. Create seasonality_factors with proper structure
                 current_month = datetime.now().strftime("%B").lower()
-                seasonality_factors = {
-                    "field": field,
-                    "seasonality_factors": {
-                        current_month: 1.0  # Default to neutral seasonality
-                    }
-                }
                 
-                # Store seasonality factors
-                mongodb_util.save_document("seasonality_factors", seasonality_factors, {"field": field})
+                # Create simple field-to-seasonality dictionary
+                seasonality_factors = {}
                 
-                # 8. Update field_companies collection
-                # Skip if company is unknown
+                # Create a month-based seasonality factor for the field
+                seasonality_by_month = {}
+                seasonality_by_month[current_month] = 1.0
+                
+                # Add to the field-specific entry
+                seasonality_factors[field] = seasonality_by_month
+                
+                # Insert as a new document
+                mongodb_util.db["seasonality_factors"].insert_one(seasonality_factors)
+                
+                # 8. Create field_companies with proper structure
+                # Only proceed if we have company information
                 if company.lower() != "unknown":
-                    field_companies = {
-                        "field": field,
-                        "companies": [company]
-                    }
+                    # Create simple dictionary with field as key and companies list as value
+                    field_companies = {}
+                    field_companies[field] = [company]
                     
-                    # Store field companies
-                    mongodb_util.save_document("field_companies", field_companies, {"field": field})
+                    # Insert as a new document
+                    mongodb_util.db["field_companies"].insert_one(field_companies)
                 
-                # 9. Update field_positions collection
-                # Skip if position is unknown
+                # 9. Create field_positions with proper structure
+                # Only proceed if we have position information
                 if position.lower() != "unknown":
-                    field_positions = {
-                        "field": field,
-                        "positions": [position]
-                    }
+                    # Create simple dictionary with field as key and positions list as value
+                    field_positions = {}
+                    field_positions[field] = [position]
                     
-                    # Store field positions
-                    mongodb_util.save_document("field_positions", field_positions, {"field": field})
+                    # Insert as a new document
+                    mongodb_util.db["field_positions"].insert_one(field_positions)
                 
                 # 10. Update offer_quality_weights collection
                 offer_quality_weights = {"weights": {}}
@@ -2467,32 +2619,62 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                 # Store offer quality weights
                 mongodb_util.save_document("offer_quality_weights", offer_quality_weights)
                 
-                # 11. Update field_arrival_rate_factors collection
-                field_arrival_rate = {
-                    "factors": {
-                        field: 1.0  # Default to neutral arrival rate
-                    }
-                }
+                # 11. Create field_arrival_rate_factors based on research data
+                field_arrival_rates = {}
                 
-                # Store field arrival rate factors
-                mongodb_util.save_document("field_arrival_rate_factors", field_arrival_rate)
+                # Set the arrival rate for this field based on researched data
+                # If job market data is available, use it to determine arrival rate
+                arrival_rate = 1.0  # Start with neutral
                 
-                # 12. Update field_arrival_factors collection
-                field_arrival_factors = {
-                    "field": field,
-                    "arrival_factors": {
-                        "base_factor": 1.0,  # Default base factor
-                        "experience_modifier": {
-                            experience_level: 1.0  # Default experience modifier
-                        },
-                        "location_modifier": {
-                            location: 1.0  # Default location modifier
-                        }
-                    }
-                }
+                # Use researched data to adjust if available
+                if "job_market" in researched_data:
+                    job_market = researched_data["job_market"]
+                    if isinstance(job_market, dict):
+                        # More jobs = higher arrival rate
+                        if "demand" in job_market and isinstance(job_market["demand"], (int, float)):
+                            demand_factor = job_market["demand"] / 5.0  # Normalize from 0-5 scale
+                            arrival_rate = max(0.5, min(1.5, demand_factor))
+                        
+                        # If we have qualitative assessment, use it
+                        if "market_health" in job_market and isinstance(job_market["market_health"], str):
+                            health = job_market["market_health"].lower()
+                            if "hot" in health or "growing" in health:
+                                arrival_rate = 1.2
+                            elif "slow" in health or "declining" in health:
+                                arrival_rate = 0.8
                 
-                # Store field arrival factors
-                mongodb_util.save_document("field_arrival_factors", field_arrival_factors, {"field": field})
+                # Set the rate for this field only - no hardcoded values
+                field_arrival_rates[field] = arrival_rate
+                
+                # Insert as a new document
+                mongodb_util.db["field_arrival_rate_factors"].insert_one(field_arrival_rates)
+                
+                # 12. Create field_arrival_factors from actual application data 
+                # Create a simple, direct field-to-factor mapping without nested structures
+                field_arrival_factors = {}
+                
+                # Simply add the field with its factor based on data analysis
+                # Use application data to determine job availability
+                factor = 1.0  # Neutral starting point
+                
+                # Adjust factor based on location if available
+                if "location_factor" in researched_data:
+                    location_data = researched_data["location_factor"]
+                    if isinstance(location_data, dict) and "data" in location_data:
+                        if "job_availability" in location_data["data"]:
+                            factor *= float(location_data["data"]["job_availability"])
+                
+                # Adjust factor based on experience level
+                if experience_level in ["junior", "entry"]:
+                    factor *= 0.9  # Fewer entry-level positions
+                elif experience_level in ["senior", "lead"]:
+                    factor *= 1.1  # More senior positions
+                
+                # Add the field with its calculated factor
+                field_arrival_factors[field] = factor
+                
+                # Insert as a new document
+                mongodb_util.db["field_arrival_factors"].insert_one(field_arrival_factors)
                 
                 print("✅ Assessment data stored across all OST collections!")
                 return {}

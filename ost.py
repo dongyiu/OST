@@ -67,7 +67,31 @@ class MongoDBUtility:
                 
                 print(f"Initialized {collection_name} collection with default data")
             
-            # Query data
+            # Special handling for known collections with multiple documents
+            if collection_name in ["common_tradeoffs", "field_arrival_factors", "field_arrival_rate_factors", 
+                                "seasonality_factors", "field_companies", "field_positions", "field_contexts",
+                                "experience_contexts", "location_contexts"] and not filter_query:
+                # For these collections, we need to merge multiple documents
+                results = {}
+                documents = list(collection.find({}, {"_id": 0}))
+                
+                # Merge all documents into a single dictionary
+                for doc in documents:
+                    # Merge document contents into results
+                    results.update(doc)
+                
+                # If we found data, return it, otherwise use default
+                if results:
+                    # Special handling for field_contexts to ensure 'general' is always available
+                    if collection_name == "field_contexts" and "general" not in results:
+                        # Add a general field as fallback 
+                        results["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+                    return results
+                    
+                # Use defaults if nothing found
+                return default_data
+            
+            # Standard query handling
             if filter_query:
                 data = collection.find_one(filter_query)
                 if data:
@@ -450,27 +474,65 @@ class ContextSystem:
         
         # Get field context (default to general if not found)
         field = user_profile.get("field", "general")
+        
+        # Create default field context if needed
+        if "general" not in self.field_contexts:
+            # Make sure we have at least a general field context
+            self.field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+            
         if field not in self.field_contexts:
             field = "general"
+            
         context["field"] = self.field_contexts[field]
+        
+        # Make sure field context has base_salary
+        if "base_salary" not in context["field"]:
+            context["field"]["base_salary"] = {"median": 60000, "std_dev": 10000}
         
         # Get experience context
         experience = user_profile.get("experience_level", "mid")
+        
+        # Make sure mid experience exists
+        if "mid" not in self.experience_contexts:
+            self.experience_contexts["mid"] = {"salary_modifier": 1.0}
+            
         if experience not in self.experience_contexts:
             experience = "mid"
+            
         context["experience"] = self.experience_contexts[experience]
+        
+        # Make sure experience has salary_modifier
+        if "salary_modifier" not in context["experience"]:
+            context["experience"]["salary_modifier"] = 1.0
         
         # Get location context
         location = user_profile.get("location", "other")
+        
+        # Make sure other location exists
+        if "other" not in self.location_contexts:
+            self.location_contexts["other"] = {"cost_modifier": 1.0}
+            
         if location not in self.location_contexts:
             location = "other"
+            
         context["location"] = self.location_contexts[location]
+        
+        # Make sure location has cost_modifier
+        if "cost_modifier" not in context["location"]:
+            context["location"]["cost_modifier"] = 1.0
         
         # Combined parameters for convenience
         context["expected_salary"] = context["field"]["base_salary"]["median"] * \
-                                   context["experience"]["salary_modifier"] * \
-                                   context["location"]["cost_modifier"]
+                                  context["experience"]["salary_modifier"] * \
+                                  context["location"]["cost_modifier"]
         
+        # Make sure general tradeoffs exist
+        if "general" not in self.common_tradeoffs:
+            self.common_tradeoffs["general"] = [
+                ["work_life_balance", "base_salary", 0.15],
+                ["career_growth", "base_salary", 0.1]
+            ]
+            
         # Add field-specific tradeoffs
         context["tradeoffs"] = self.common_tradeoffs.get(field, self.common_tradeoffs["general"])
         
@@ -637,7 +699,9 @@ class EnhancedPreferenceProcessor:
         for var_name, weight in list(weights.items()):
             # Adjust based on experience level
             if var_name == "career_growth":
-                weights[var_name] *= self.context["experience"]["career_growth_importance"]
+                # Get career_growth_importance safely with a default value if missing
+                career_growth_importance = self.context.get("experience", {}).get("career_growth_importance", 1.0)
+                weights[var_name] *= career_growth_importance
             
             # Adjust based on field
             if var_name in self.context["field"].get("variables", {}):
@@ -669,9 +733,17 @@ class EnhancedPreferenceProcessor:
                 
             # For numeric constraints
             if isinstance(constraint_value, (int, float)) and isinstance(offer_value, (int, float)):
-                if var_type.higher_is_better and offer_value < constraint_value:
+                # Check if var_type is a dictionary or an object
+                if isinstance(var_type, dict):
+                    # If it's a dictionary, access the higher_is_better key
+                    higher_is_better = var_type.get('higher_is_better', True)
+                else:
+                    # If it's an object, access the higher_is_better attribute
+                    higher_is_better = var_type.higher_is_better
+                    
+                if higher_is_better and offer_value < constraint_value:
                     return False, f"{var_name} ({offer_value}) below minimum requirement ({constraint_value})"
-                elif not var_type.higher_is_better and offer_value > constraint_value:
+                elif not higher_is_better and offer_value > constraint_value:
                     return False, f"{var_name} ({offer_value}) above maximum acceptable ({constraint_value})"
             
             # For boolean constraints
@@ -761,7 +833,14 @@ class EnhancedPreferenceProcessor:
             return value / 10.0
             
         # Get normalization method for this variable
-        method = var_type.normalization_method
+        # Check if var_type is a dictionary or an object
+        if isinstance(var_type, dict):
+            # If it's a dictionary, access the normalization_method key
+            method = var_type.get('normalization_method', 'absolute_scale')
+        else:
+            # If it's an object, access the normalization_method attribute
+            method = var_type.normalization_method
+            
         normalize_fn = self.normalization_functions.get(method, self._normalize_absolute_scale)
         
         # Apply normalization function
@@ -893,8 +972,14 @@ class EnhancedBayesianModel:
         # Set up priors for each attribute based on semantic understanding
         for var_name, var_type in VARIABLE_TYPES.items():
             if var_name != "base_salary" and var_name != "total_compensation":
+                # Check if var_type is a VariableType object or a dictionary
+                if isinstance(var_type, dict):
+                    is_context_dependent = var_type.get('context_dependent', False)
+                else:
+                    is_context_dependent = var_type.context_dependent
+                
                 # Set field-specific priors when applicable
-                if var_type.context_dependent and var_name in self.context["field"].get("variables", {}):
+                if is_context_dependent and var_name in self.context["field"].get("variables", {}):
                     field_info = self.context["field"]["variables"][var_name]
                     # For boolean values
                     if isinstance(field_info, bool):
@@ -985,13 +1070,26 @@ class EnhancedBayesianModel:
                     continue
                     
                 # Normalize based on variable type
-                if var_type.var_type == "quality" or var_type.var_type == "alignment":
-                    normalized_value = (value - 1) / 9.0  # 1-10 scale to 0-1
-                elif var_type.var_type == "boolean":
-                    normalized_value = value / 10.0  # 0-10 scale to 0-1
+                # Check if var_type is a dictionary or an object
+                if isinstance(var_type, dict):
+                    # If it's a dictionary, access the var_type key
+                    var_type_value = var_type.get('var_type', '')
+                    if var_type_value in ["quality", "alignment"]:
+                        normalized_value = (value - 1) / 9.0  # 1-10 scale to 0-1
+                    elif var_type_value == "boolean":
+                        normalized_value = value / 10.0  # 0-10 scale to 0-1
+                    else:
+                        # Skip variables we don't know how to normalize
+                        continue
                 else:
-                    # Skip variables we don't know how to normalize
-                    continue
+                    # If it's an object, access the var_type attribute
+                    if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                        normalized_value = (value - 1) / 9.0  # 1-10 scale to 0-1
+                    elif var_type.var_type == "boolean":
+                        normalized_value = value / 10.0  # 0-10 scale to 0-1
+                    else:
+                        # Skip variables we don't know how to normalize
+                        continue
                 
                 # Update model
                 self._update_attribute_model(attr_name, normalized_value)
@@ -1068,12 +1166,24 @@ class EnhancedBayesianModel:
                     continue
                     
                 # Normalize value
-                if var_type.var_type == "quality" or var_type.var_type == "alignment":
-                    normalized_value = (offer[attr_name] - 1) / 9.0
-                elif var_type.var_type == "boolean":
-                    normalized_value = offer[attr_name] / 10.0
+                # Check if var_type is a dictionary or an object
+                if isinstance(var_type, dict):
+                    # If it's a dictionary, access the var_type key
+                    var_type_value = var_type.get('var_type', '')
+                    if var_type_value in ["quality", "alignment"]:
+                        normalized_value = (offer[attr_name] - 1) / 9.0
+                    elif var_type_value == "boolean":
+                        normalized_value = offer[attr_name] / 10.0
+                    else:
+                        continue
                 else:
-                    continue
+                    # If it's an object, access the var_type attribute
+                    if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                        normalized_value = (offer[attr_name] - 1) / 9.0
+                    elif var_type.var_type == "boolean":
+                        normalized_value = offer[attr_name] / 10.0
+                    else:
+                        continue
                 
                 # Check if this attribute was below expected
                 posterior_mean = model['alpha'] / (model['alpha'] + model['beta'])
@@ -1141,8 +1251,9 @@ class EnhancedBayesianModel:
         # Apply location adjustment
         adjusted_salary = salary_sample * self.context["location"]["cost_modifier"]
         
-        # Ensure reasonable bounds
-        return max(self.user_preferences.get("min_salary", 30000), adjusted_salary)
+        # Don't enforce minimum salary at generation time - let the OST algorithm decide
+        # We want a realistic range of offers, including some below the minimum threshold
+        return max(30000, adjusted_salary)  # Just ensure it's not unreasonably low
     
     def generate_attribute_sample(self, attr_name: str) -> float:
         """Generate attribute sample from current beliefs."""
@@ -1161,14 +1272,25 @@ class EnhancedBayesianModel:
         if not var_type:
             # Default to 1-10 scale
             return 1 + 9 * value_0_1
-            
-        # Convert to appropriate scale based on variable type
-        if var_type.var_type == "quality" or var_type.var_type == "alignment":
-            return 1 + 9 * value_0_1  # 0-1 to 1-10 scale
-        elif var_type.var_type == "boolean":
-            return 10 * value_0_1  # 0-1 to 0-10 scale
+        
+        # Check if var_type is a dictionary or an object
+        if isinstance(var_type, dict):
+            # If it's a dictionary, access the var_type key
+            var_type_value = var_type.get('var_type', 'quality')
+            if var_type_value in ["quality", "alignment"]:
+                return 1 + 9 * value_0_1  # 0-1 to 1-10 scale
+            elif var_type_value == "boolean":
+                return 10 * value_0_1  # 0-1 to 0-10 scale
+            else:
+                return 1 + 9 * value_0_1  # Default to 1-10 scale
         else:
-            return 1 + 9 * value_0_1  # Default to 1-10 scale
+            # If it's an object, access the var_type attribute
+            if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                return 1 + 9 * value_0_1  # 0-1 to 1-10 scale
+            elif var_type.var_type == "boolean":
+                return 10 * value_0_1  # 0-1 to 0-10 scale
+            else:
+                return 1 + 9 * value_0_1  # Default to 1-10 scale
     
     def get_market_condition(self, time_point: float) -> float:
         """Get current market condition with semantic understanding."""
@@ -1273,8 +1395,24 @@ class EnhancedBayesianModel:
         # Get market condition
         market_condition = self.get_market_condition(time_point)
         
-        # Generate salary based on current beliefs and market
+        # Generate salary based on current beliefs and market with more variance
+        # Calculate user's minimum salary (from preferences) or default to 70% of the expected salary
+        min_salary = self.user_preferences.get("min_salary", self.salary_model['mu'] * 0.7)
+        
+        # Generate base salary with increased variance
         base_salary = self.generate_salary_sample() * market_condition
+        
+        # For variety, sometimes generate salaries well above min_salary to have some good offers
+        if random.random() < 0.5:  # 50% chance to get a higher salary
+            # Boosted salary between min_salary and min_salary * 1.8
+            boost_factor = 1.0 + random.uniform(0.3, 0.8)  
+            base_salary = max(base_salary, min_salary * boost_factor)
+            
+        # Ensure we occasionally get very good offers (10% chance)
+        if random.random() < 0.1:
+            # Generate a top-tier offer
+            boost_factor = 1.5 + random.uniform(0.3, 0.5)  # 1.8-2.0x multiplier
+            base_salary = max(base_salary, min_salary * boost_factor)
         
         # Create offer
         offer = {
@@ -1285,10 +1423,28 @@ class EnhancedBayesianModel:
         }
         
         # Decide offer quality profile using weights from MongoDB
-        offer_quality = random.choices(
-            list(offer_quality_weights.keys()),
-            weights=list(offer_quality_weights.values())
-        )[0]
+        # Check if offer_quality_weights is a list containing a dictionary (as returned from MongoDB)
+        if isinstance(offer_quality_weights, list) and len(offer_quality_weights) > 0 and isinstance(offer_quality_weights[0], dict):
+            # Use the first dictionary in the list
+            quality_weights = offer_quality_weights[0].get('weights', {})
+            if quality_weights:
+                offer_quality = random.choices(
+                    list(quality_weights.keys()),
+                    weights=list(quality_weights.values())
+                )[0]
+            else:
+                # Fallback to default "medium" quality
+                offer_quality = "medium"
+        else:
+            # Original behavior if offer_quality_weights is a dictionary as expected
+            try:
+                offer_quality = random.choices(
+                    list(offer_quality_weights.keys()),
+                    weights=list(offer_quality_weights.values())
+                )[0]
+            except (TypeError, ValueError):
+                # Fallback to default "medium" quality
+                offer_quality = "medium"
         
         # Add attributes based on semantic understanding
         for attr_name, var_type in VARIABLE_TYPES.items():
@@ -1354,12 +1510,24 @@ class EnhancedBayesianModel:
             return 1 + 9 * expected_value
             
         # Convert to appropriate scale based on variable type
-        if var_type.var_type == "quality" or var_type.var_type == "alignment":
-            return 1 + 9 * expected_value  # 0-1 to 1-10 scale
-        elif var_type.var_type == "boolean":
-            return 10 * expected_value  # 0-1 to 0-10 scale
+        # Check if var_type is a dictionary or an object
+        if isinstance(var_type, dict):
+            # If it's a dictionary, access the var_type key
+            var_type_value = var_type.get('var_type', '')
+            if var_type_value in ["quality", "alignment"]:
+                return 1 + 9 * expected_value  # 0-1 to 1-10 scale
+            elif var_type_value == "boolean":
+                return 10 * expected_value  # 0-1 to 0-10 scale
+            else:
+                return 1 + 9 * expected_value  # Default to 1-10 scale
         else:
-            return 1 + 9 * expected_value  # Default to 1-10 scale
+            # If it's an object, access the var_type attribute
+            if var_type.var_type == "quality" or var_type.var_type == "alignment":
+                return 1 + 9 * expected_value  # 0-1 to 1-10 scale
+            elif var_type.var_type == "boolean":
+                return 10 * expected_value  # 0-1 to 0-10 scale
+            else:
+                return 1 + 9 * expected_value  # Default to 1-10 scale
 
 # ===========================================================================
 # 5. ENHANCED OPTIMAL STOPPING ALGORITHM
@@ -1619,12 +1787,12 @@ class SemanticOST:
                         experience_factor
         
         # MODIFICATION 5: Boost reservation utility directly
-        adjusted_utility += 1.0  # Add a flat boost to make more selective
+        adjusted_utility += 3.0  # Add a flat boost to make more selective
         
         # Lower bound based on risk tolerance and employment status
         if self.employment_status == 'unemployed':
             # Lower floor when unemployed - can't be as selective
-            min_acceptable = 0 * (1 - self.risk_tolerance)
+            min_acceptable = 0.6 * (2 - self.risk_tolerance) 
         else:
             min_acceptable = 2 * (1 - self.risk_tolerance)
         
@@ -2063,12 +2231,8 @@ DEFAULT_FIELD_PREFERENCES = {
     }
 }
 
-# Initialize field profiles and preferences in MongoDB
-for field, profile in DEFAULT_FIELD_PROFILES.items():
-    mongodb_util.save_document("user_profiles", profile, {"field": field})
-
-for field, preferences in DEFAULT_FIELD_PREFERENCES.items():
-    mongodb_util.save_document("user_preferences", preferences, {"field": field})
+# This initialization has been moved to create_user_profile to avoid multiple duplications
+# It will only initialize if the profiles don't exist
 
 def create_user_profile(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -2087,18 +2251,50 @@ def create_user_profile(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # Get fallback field (default to software_engineering if field not found)
     fallback_field = "software_engineering"
     
-    # Load default profile and preferences for this field
-    default_user_profile = DEFAULT_FIELD_PROFILES.get(field, DEFAULT_FIELD_PROFILES.get(fallback_field)).copy()
-    default_user_preferences = DEFAULT_FIELD_PREFERENCES.get(field, DEFAULT_FIELD_PREFERENCES.get(fallback_field)).copy()
-    
-    # Ensure field is set correctly
-    default_user_profile["field"] = field
-    default_user_preferences["field"] = field
-    
-    # Load from MongoDB if available, using field as filter
+    # Check if we already have profiles for this field in MongoDB
     filter_query = {"field": field}
-    user_profile = mongodb_util.load_data("user_profiles", filter_query, default_data=default_user_profile)
-    user_preferences = mongodb_util.load_data("user_preferences", filter_query, default_data=default_user_preferences)
+    
+    # Attempt to load existing profile
+    collection = mongodb_util.db["user_profiles"]
+    existing_profile = collection.find_one(filter_query) if mongodb_util.connected else None
+    
+    if existing_profile:
+        # Profile exists - load from database
+        user_profile = dict(existing_profile)
+        if '_id' in user_profile:
+            del user_profile['_id']
+    else:
+        # Profile doesn't exist - create new default and save
+        default_user_profile = DEFAULT_FIELD_PROFILES.get(field, DEFAULT_FIELD_PROFILES.get(fallback_field)).copy()
+        default_user_profile["field"] = field  # Ensure field is set correctly
+        
+        # Save to MongoDB (only if not already there)
+        if mongodb_util.connected:
+            collection.insert_one(default_user_profile)
+            print(f"Created new user profile for field: {field}")
+            
+        user_profile = default_user_profile
+    
+    # Now do the same for preferences
+    collection = mongodb_util.db["user_preferences"]
+    existing_preferences = collection.find_one(filter_query) if mongodb_util.connected else None
+    
+    if existing_preferences:
+        # Preferences exist - load from database
+        user_preferences = dict(existing_preferences)
+        if '_id' in user_preferences:
+            del user_preferences['_id']
+    else:
+        # Preferences don't exist - create defaults and save
+        default_user_preferences = DEFAULT_FIELD_PREFERENCES.get(field, DEFAULT_FIELD_PREFERENCES.get(fallback_field)).copy()
+        default_user_preferences["field"] = field  # Ensure field is set correctly
+        
+        # Save to MongoDB (only if not already there)
+        if mongodb_util.connected:
+            collection.insert_one(default_user_preferences)
+            print(f"Created new user preferences for field: {field}")
+            
+        user_preferences = default_user_preferences
     
     return user_profile, user_preferences
 
@@ -2203,18 +2399,44 @@ def run_semantic_ost_simulation():
         print("Key attributes:")
         
         # Print top attributes (excluding monetary)
-        top_attrs = sorted(
-            [(k, v) for k, v in offer.items() 
-             if k in VARIABLE_TYPES and 
-             VARIABLE_TYPES[k].var_type not in ["monetary"] and
-             isinstance(v, (int, float))],
-            key=lambda x: x[1], reverse=True
-        )[:4]
+        # Check if variable types are dictionaries or objects
+        top_attrs = []
+        for k, v in offer.items():
+            if k in VARIABLE_TYPES and isinstance(v, (int, float)):
+                var_type = VARIABLE_TYPES[k]
+                # Check if it's a dictionary
+                if isinstance(var_type, dict):
+                    var_type_value = var_type.get('var_type', '')
+                    if var_type_value not in ["monetary"]:
+                        top_attrs.append((k, v))
+                else:
+                    # It's an object
+                    if var_type.var_type not in ["monetary"]:
+                        top_attrs.append((k, v))
+                        
+        # Sort and take top 4
+        top_attrs = sorted(top_attrs, key=lambda x: x[1], reverse=True)[:4]
         
         for attr_name, value in top_attrs:
             var_type = VARIABLE_TYPES.get(attr_name)
             if var_type:
-                print(f"  {attr_name}: {value}/10 ({var_type.description})")
+                # Check if it's a dictionary
+                if isinstance(var_type, dict):
+                    description = var_type.get('description', attr_name)
+                else:
+                    description = var_type.description
+                # Check if this is a monetary attribute (base_salary, total_compensation)
+                is_monetary = False
+                if isinstance(var_type, dict):
+                    is_monetary = var_type.get('var_type') == 'monetary'
+                else:
+                    is_monetary = var_type.var_type == 'monetary'
+                
+                # Format differently based on attribute type
+                if attr_name in ['base_salary', 'total_compensation'] or is_monetary:
+                    print(f"  {attr_name}: ${value:,.2f} ({description})")
+                else:
+                    print(f"  {attr_name}: {value}/10 ({description})")
         
         # Check hard constraints first
         meets_constraints, constraint_reason = ost.preference_processor.check_hard_constraints(offer)
