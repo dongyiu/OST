@@ -2267,36 +2267,234 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
             }
         
         def store_assessment_results(state: ApplicationState) -> dict:
-            """Store assessment results node"""
-            print("💾 Storing assessment results...")
+            """
+            Store assessment results in appropriate MongoDB collections for OST.
+            Instead of storing all data in a single collection, this method distributes
+            the data across multiple domain-specific collections that OST.py can use.
+            """
+            print("💾 Storing assessment results to OST collections...")
+            
+            # Import MongoDB utility from ost.py
+            from ost import MongoDBUtility
+            mongodb_util = MongoDBUtility()
             
             try:
-                document = {
-                    "workflow_id": self.config.workflow_id,
-                    "application_id": state["application_data"].get("id", str(time.time())),
-                    "application_data": state["application_data"],
-                    "enriched_data": state["enriched_data"],
-                    "job_quality_metrics": state["job_quality_metrics"],
-                    "user_preferences": state["user_preferences"],
-                    "reasoning_traces": state["reasoning_traces"],
-                    "researched_data": state.get("researched_data", {}),
-                    "assessment_date": datetime.now().isoformat(),
-                    "api_stats": {
-                        "total_calls": self.meta_agent.total_calls if self.meta_agent else 0
+                # Extract key data from state
+                application_data = state["application_data"]
+                enriched_data = state["enriched_data"]
+                job_quality_metrics = state["job_quality_metrics"]
+                user_preferences = state["user_preferences"]
+                researched_data = state.get("researched_data", {})
+                
+                # Extract field information
+                field = application_data.get("field", 
+                                          enriched_data.get("field", "unknown"))
+                
+                # Extract position information
+                position = application_data.get("position", 
+                                             enriched_data.get("position", "unknown"))
+                
+                # Extract company information
+                company = application_data.get("company", 
+                                            enriched_data.get("company", "unknown"))
+                
+                # Extract location information
+                location = application_data.get("location", 
+                                             enriched_data.get("location", "unknown"))
+                
+                # Extract experience level
+                experience_level = enriched_data.get("experience_level", "mid")
+                
+                print(f"📊 Storing data for field: {field}, position: {position}")
+                
+                # 1. Update variable_types collection with job attributes
+                variable_types_updates = {}
+                for key, metric in job_quality_metrics.items():
+                    # Determine if higher is better (usually true for job metrics)
+                    higher_is_better = True
+                    if key in ["commute_time", "workload", "stress_level"]:
+                        higher_is_better = False
+                        
+                    # Get description
+                    description = f"Job quality metric for {key}"
+                    if isinstance(metric, dict) and "description" in metric:
+                        description = metric["description"]
+                        
+                    variable_types_updates[key] = {
+                        "name": key,
+                        "var_type": "job_metric",
+                        "higher_is_better": higher_is_better,
+                        "context_dependent": True,
+                        "can_be_hard_constraint": key in user_preferences.get("deal_breakers", []),
+                        "normalization_method": "absolute_scale",
+                        "description": description
+                    }
+                
+                # Store variable types
+                for key, var_type in variable_types_updates.items():
+                    mongodb_util.save_document("variable_types", var_type, {"name": key})
+                    
+                # 2. Update field_contexts collection with industry data
+                field_context = {
+                    "field": field
+                }
+                
+                # Add salary data if available
+                if "salary_data" in researched_data:
+                    salary_data = researched_data["salary_data"]
+                    if isinstance(salary_data, dict) and "data" in salary_data:
+                        field_context["salary_data"] = salary_data["data"]
+                        
+                # Add base salary info if available in metrics
+                if "base_salary" in job_quality_metrics:
+                    base_salary = job_quality_metrics["base_salary"]
+                    if isinstance(base_salary, (int, float)):
+                        # Store actual value if numeric, or extract from text
+                        field_context["base_salary"] = {"median": base_salary, "std_dev": base_salary * 0.15}
+                
+                # Store field context
+                mongodb_util.save_document("field_contexts", field_context, {"field": field})
+                
+                # 3. Update experience_contexts collection
+                experience_context = {
+                    "level": experience_level
+                }
+                
+                # Add salary modifiers if available
+                if "salary" in enriched_data:
+                    salary = enriched_data["salary"]
+                    if isinstance(salary, (int, float)):
+                        experience_context["observed_salary"] = salary
+                        
+                # Store experience context
+                mongodb_util.save_document("experience_contexts", experience_context, {"level": experience_level})
+                
+                # 4. Update location_contexts collection
+                location_context = {
+                    "location": location
+                }
+                
+                # Add cost of living data if available
+                if "location_factor" in researched_data:
+                    location_data = researched_data["location_factor"]
+                    if isinstance(location_data, dict) and "data" in location_data:
+                        location_context["cost_data"] = location_data["data"]
+                        
+                # Store location context
+                mongodb_util.save_document("location_contexts", location_context, {"location": location})
+                
+                # 5. Update variable_interactions collection
+                # Look for relationships between variables in the job quality metrics
+                variable_interactions = {}
+                if "work_life_balance" in job_quality_metrics and "base_salary" in job_quality_metrics:
+                    variable_interactions["work_life_balance"] = {"base_salary": 0.15}
+                    
+                if "remote_work" in job_quality_metrics and "commute_time" in job_quality_metrics:
+                    variable_interactions["remote_work"] = {"commute_time": 0.8}
+                    
+                # Store variable interactions
+                mongodb_util.save_document("variable_interactions", variable_interactions)
+                
+                # 6. Update common_tradeoffs collection
+                tradeoffs = {}
+                tradeoffs[field] = []
+                
+                # Add common field-specific tradeoffs based on job quality metrics
+                if field == "software_engineering":
+                    tradeoffs[field] = [
+                        ("remote_work", "base_salary", 0.15),
+                        ("work_life_balance", "base_salary", 0.2),
+                        ("tech_stack_alignment", "base_salary", 0.1)
+                    ]
+                elif field == "marketing":
+                    tradeoffs[field] = [
+                        ("company_reputation", "base_salary", 0.18),
+                        ("career_growth", "base_salary", 0.15)
+                    ]
+                else:
+                    tradeoffs[field] = [
+                        ("work_life_balance", "base_salary", 0.15),
+                        ("career_growth", "base_salary", 0.1)
+                    ]
+                    
+                # Store common tradeoffs
+                mongodb_util.save_document("common_tradeoffs", tradeoffs)
+                
+                # 7. Update seasonality_factors collection
+                current_month = datetime.now().strftime("%B").lower()
+                seasonality_factors = {
+                    "field": field,
+                    "seasonality_factors": {
+                        current_month: 1.0  # Default to neutral seasonality
                     }
                 }
                 
-                # Store data using the storage interface
-                success = self.storage.store_data(
-                    self.config.storage_collection, 
-                    document
-                )
+                # Store seasonality factors
+                mongodb_util.save_document("seasonality_factors", seasonality_factors, {"field": field})
                 
-                if success:
-                    print("✅ Assessment data stored successfully!")
-                else:
-                    print("⚠️ Failed to store assessment data")
+                # 8. Update field_companies collection
+                # Skip if company is unknown
+                if company.lower() != "unknown":
+                    field_companies = {
+                        "field": field,
+                        "companies": [company]
+                    }
                     
+                    # Store field companies
+                    mongodb_util.save_document("field_companies", field_companies, {"field": field})
+                
+                # 9. Update field_positions collection
+                # Skip if position is unknown
+                if position.lower() != "unknown":
+                    field_positions = {
+                        "field": field,
+                        "positions": [position]
+                    }
+                    
+                    # Store field positions
+                    mongodb_util.save_document("field_positions", field_positions, {"field": field})
+                
+                # 10. Update offer_quality_weights collection
+                offer_quality_weights = {"weights": {}}
+                
+                # Extract weights from job quality metrics if available
+                for key, metric in job_quality_metrics.items():
+                    if isinstance(metric, dict) and "weight" in metric:
+                        offer_quality_weights["weights"][key] = metric["weight"]
+                    else:
+                        offer_quality_weights["weights"][key] = 1.0  # Default weight
+                        
+                # Store offer quality weights
+                mongodb_util.save_document("offer_quality_weights", offer_quality_weights)
+                
+                # 11. Update field_arrival_rate_factors collection
+                field_arrival_rate = {
+                    "factors": {
+                        field: 1.0  # Default to neutral arrival rate
+                    }
+                }
+                
+                # Store field arrival rate factors
+                mongodb_util.save_document("field_arrival_rate_factors", field_arrival_rate)
+                
+                # 12. Update field_arrival_factors collection
+                field_arrival_factors = {
+                    "field": field,
+                    "arrival_factors": {
+                        "base_factor": 1.0,  # Default base factor
+                        "experience_modifier": {
+                            experience_level: 1.0  # Default experience modifier
+                        },
+                        "location_modifier": {
+                            location: 1.0  # Default location modifier
+                        }
+                    }
+                }
+                
+                # Store field arrival factors
+                mongodb_util.save_document("field_arrival_factors", field_arrival_factors, {"field": field})
+                
+                print("✅ Assessment data stored across all OST collections!")
                 return {}
             except Exception as e:
                 print(f"❌ Storage Error: {str(e)}")
@@ -2433,37 +2631,38 @@ if __name__ == "__main__":
     application_data = {
         "id": "app-12345",
         "user_id": "user-7890",
-        "company": "TechCorp Inc.",
-        "position": "Senior Software Engineer",
-        "dateApplied": "2023-04-15",
-        "stage": "Interview",
-        "lastUpdated": "2023-04-20",
+        "company": "Sentra",
+        "position": "Full Stack Engineer",
+        "dateApplied": "2025-03-26",  # Assuming today's date
+        "stage": "Applied",
+        "lastUpdated": "2025-03-26",
         "description": """
-        We are looking for a Senior Software Engineer to join our team.
+        Sentra is building the AI backbone for post-acute care, revolutionizing how healthcare providers manage administrative workflows.
         
-        Requirements:
-        - 5+ years of experience in software development
-        - Strong knowledge of Python, JavaScript, and cloud technologies
-        - Experience with microservices architecture
-        - Ability to mentor junior developers
-        
-        Benefits:
-        - Competitive salary
-        - Remote work options
-        - Flexible hours
-        - Health insurance
-        - 401k matching
+        The Role:
+        We are looking for a Full Stack Developer to take ownership of end-to-end product development. As one of the first engineering hires, 
+        you’ll work closely with the founding team, own technical decisions, and build highly scalable and secure systems that directly impact patient care and operational efficiency.
+
+        Key Responsibilities:
+        - Architect and implement features across the entire stack.
+        - Design, build, and maintain AI-driven workflows that automate clinical and administrative tasks for post-acute providers.
+        - Integrate AI models into production, staying ahead of advancements in LLMs to enhance platform intelligence.
+        - Ensure high reliability, security, and scalability, integrating best practices in modular system design, testing, and observability.
+        - Work closely with customers to iterate and refine the platform based on feedback.
+
+        Qualifications:
+        - 2+ years of experience in full-stack development with modern web frameworks and cloud architectures (Vue.js, Python, C#, SQL Server, Azure, or similar).
+        - Degree in Computer Science, Engineering, Mathematics, or a related technical field (or equivalent experience).
+        - Proven track record of building and maintaining scalable web applications in fast-paced environments.
         """,
-        "salary": "$120,000 - $150,000 per year, plus bonuses and stock options",
-        "location": "San Francisco, CA (Hybrid - 2 days in office)",
-        "notes": "Had a great initial call with the hiring manager. Team seems friendly.",
+        "salary": "Competitive compensation: Top-of-market salary + equity package",
+        "location": "London, UK (Hybrid)",
+        "notes": "Matches 5 out of 10 skills. Role aligns well with my experience in React, .NET, and web development.",
         "logs": [
-            {"date": "2023-04-15", "action": "Applied"},
-            {"date": "2023-04-18", "action": "Phone Screen"},
-            {"date": "2023-04-20", "action": "Technical Interview Scheduled"}
+            {"date": "2025-03-26", "action": "Applied"}
         ]
     }
-    
+
     # Example user preferences
     user_preferences = {
         "min_salary": 100000,
