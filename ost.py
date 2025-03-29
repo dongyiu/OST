@@ -358,6 +358,8 @@ class ContextSystem:
     
     def __init__(self):
         """Initialize with context definitions."""
+        # Set up MongoDB utility for accessing user-specific data
+        self.mongodb_util = MongoDBUtility()
         # Define default field-specific context information
         default_field_contexts = {
             "software_engineering": {
@@ -472,18 +474,53 @@ class ContextSystem:
         """
         context = {}
         
+        # Check if user has a specific user_id
+        user_id = user_profile.get("user_id")
+        
         # Get field context (default to general if not found)
         field = user_profile.get("field", "general")
         
-        # Create default field context if needed
-        if "general" not in self.field_contexts:
-            # Make sure we have at least a general field context
-            self.field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
-            
-        if field not in self.field_contexts:
-            field = "general"
-            
-        context["field"] = self.field_contexts[field]
+        # Check for user-specific field context if user_id exists
+        if user_id:
+            try:
+                # Query MongoDB directly to find user-specific field context
+                user_field_context = self.mongodb_util.db["field_contexts"].find_one({"user_id": user_id})
+                if user_field_context and field in user_field_context:
+                    # Use user-specific field context
+                    context["field"] = user_field_context[field]
+                    print(f"✅ Using user-specific field context for user_id: {user_id}")
+                    # Continue with the rest of context setup
+                else:
+                    # Fall back to default field context
+                    if "general" not in self.field_contexts:
+                        # Make sure we have at least a general field context
+                        self.field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+                        
+                    if field not in self.field_contexts:
+                        field = "general"
+                        
+                    context["field"] = self.field_contexts[field]
+            except Exception as e:
+                print(f"❌ Error retrieving user-specific field context: {str(e)}")
+                # Fall back to default field context
+                if "general" not in self.field_contexts:
+                    self.field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+                
+                if field not in self.field_contexts:
+                    field = "general"
+                    
+                context["field"] = self.field_contexts[field]
+        else:
+            # Use default field context
+            # Create default field context if needed
+            if "general" not in self.field_contexts:
+                # Make sure we have at least a general field context
+                self.field_contexts["general"] = {"base_salary": {"median": 60000, "std_dev": 10000}}
+                
+            if field not in self.field_contexts:
+                field = "general"
+                
+            context["field"] = self.field_contexts[field]
         
         # Make sure field context has base_salary
         if "base_salary" not in context["field"]:
@@ -492,14 +529,46 @@ class ContextSystem:
         # Get experience context
         experience = user_profile.get("experience_level", "mid")
         
-        # Make sure mid experience exists
-        if "mid" not in self.experience_contexts:
-            self.experience_contexts["mid"] = {"salary_modifier": 1.0}
-            
-        if experience not in self.experience_contexts:
-            experience = "mid"
-            
-        context["experience"] = self.experience_contexts[experience]
+        # Check for user-specific experience context if user_id exists
+        if user_id:
+            try:
+                # Query MongoDB directly to find user-specific experience context
+                user_exp_contexts = list(self.mongodb_util.db["experience_contexts"].find({"user_id": user_id}))
+                for exp_context in user_exp_contexts:
+                    if experience in exp_context:
+                        # Use user-specific experience context
+                        context["experience"] = exp_context[experience]
+                        print(f"✅ Using user-specific experience context for user_id: {user_id}")
+                        break
+                else:
+                    # If no user-specific context found, fall back to default
+                    if "mid" not in self.experience_contexts:
+                        self.experience_contexts["mid"] = {"salary_modifier": 1.0}
+                        
+                    if experience not in self.experience_contexts:
+                        experience = "mid"
+                        
+                    context["experience"] = self.experience_contexts[experience]
+            except Exception as e:
+                print(f"❌ Error retrieving user-specific experience context: {str(e)}")
+                # Fall back to default experience context
+                if "mid" not in self.experience_contexts:
+                    self.experience_contexts["mid"] = {"salary_modifier": 1.0}
+                    
+                if experience not in self.experience_contexts:
+                    experience = "mid"
+                    
+                context["experience"] = self.experience_contexts[experience]
+        else:
+            # Use default experience context
+            # Make sure mid experience exists
+            if "mid" not in self.experience_contexts:
+                self.experience_contexts["mid"] = {"salary_modifier": 1.0}
+                
+            if experience not in self.experience_contexts:
+                experience = "mid"
+                
+            context["experience"] = self.experience_contexts[experience]
         
         # Make sure experience has salary_modifier
         if "salary_modifier" not in context["experience"]:
@@ -640,6 +709,9 @@ class EnhancedPreferenceProcessor:
         self.user_profile = user_profile
         self.user_preferences = user_preferences
         
+        # Set up MongoDB utility for accessing user-specific data
+        self.mongodb_util = MongoDBUtility()
+        
         # Set up context system
         self.context_system = ContextSystem()
         self.context = self.context_system.get_context(user_profile)
@@ -695,17 +767,56 @@ class EnhancedPreferenceProcessor:
                 var_name = key.replace("_weight", "")
                 weights[var_name] = float(value)
         
+        # Get user_id from user_profile or user_preferences
+        user_id = self.user_profile.get('user_id') or self.user_preferences.get('user_id')
+        
         # Adjust weights based on context
         for var_name, weight in list(weights.items()):
             # Adjust based on experience level
             if var_name == "career_growth":
-                # Get career_growth_importance safely with a default value if missing
-                career_growth_importance = self.context.get("experience", {}).get("career_growth_importance", 1.0)
+                # First check for user-specific experience context
+                experience_context = None
+                
+                # Look for user-specific experience context
+                if user_id and "experience" in self.context:
+                    for exp_context in self.mongodb_util.db["experience_contexts"].find({"user_id": user_id}):
+                        if exp_context:
+                            # Found user-specific context
+                            experience_level = self.user_profile.get("experience_level", "mid")
+                            if experience_level in exp_context:
+                                experience_context = exp_context[experience_level]
+                                break
+                
+                # Get career_growth_importance either from user-specific context or default context
+                if experience_context and "career_growth_importance" in experience_context:
+                    career_growth_importance = experience_context["career_growth_importance"]
+                else:
+                    # Fall back to default context
+                    career_growth_importance = self.context.get("experience", {}).get("career_growth_importance", 1.0)
+                
                 weights[var_name] *= career_growth_importance
             
             # Adjust based on field
             if var_name in self.context["field"].get("variables", {}):
-                field_factor = self.context["field"]["variables"][var_name]
+                # Check if there are user-specific field variables
+                field_variables = self.context["field"]["variables"]
+                
+                # Look for user-specific field variables
+                if user_id:
+                    # Query MongoDB for user-specific field context
+                    user_field_context = self.mongodb_util.db["field_contexts"].find_one(
+                        {"user_id": user_id, self.user_profile.get("field", "general"): {"$exists": True}}
+                    )
+                    
+                    if user_field_context and var_name in user_field_context.get(self.user_profile.get("field", "general"), {}).get("variables", {}):
+                        # Use user-specific field factor
+                        field_factor = user_field_context[self.user_profile.get("field", "general")]["variables"][var_name]
+                        if isinstance(field_factor, (int, float)):
+                            weights[var_name] *= field_factor
+                            continue
+                
+                # Fall back to default field variables
+                field_factor = field_variables.get(var_name)
                 if isinstance(field_factor, (int, float)):
                     weights[var_name] *= field_factor
         

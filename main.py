@@ -12,6 +12,7 @@ import random
 import backoff
 import json
 import os
+import uuid
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, GoogleAPIError
 from dotenv import load_dotenv
 from ost import (MongoDBUtility, create_user_profile, DEFAULT_FIELD_PROFILES, DEFAULT_FIELD_PREFERENCES,
@@ -331,30 +332,41 @@ class OSTDataTransformer:
         return user_profile, user_preferences
     
     @staticmethod
-    def save_to_ost_collections(user_profile, user_preferences):
+    def save_to_ost_collections(user_profile, user_preferences, user_id=None):
         """
         Save user profile and preferences to OST's MongoDB collections.
         
         Args:
             user_profile: User profile data
             user_preferences: User preferences data
+            user_id: Optional user ID to associate with the data
             
         Returns:
-            Success status
+            Dictionary with success status and user_id
         """
         try:
             # Create MongoDB utility
             mongodb_util = MongoDBUtility()
             
+            # Generate a user ID if none provided
+            if not user_id:
+                user_id = str(uuid.uuid4())
+            
+            # Add user_id to profile and preferences
+            user_profile["user_id"] = user_id
+            user_preferences["user_id"] = user_id
+            
             # Save profile and preferences
             field = user_profile.get("field", "unknown")
-            mongodb_util.save_document("user_profiles", user_profile, {"field": field})
-            mongodb_util.save_document("user_preferences", user_preferences, {"field": field})
+            mongodb_util.save_document("user_profiles", user_profile, 
+                                      {"user_id": user_id, "field": field})
+            mongodb_util.save_document("user_preferences", user_preferences, 
+                                      {"user_id": user_id, "field": field})
             
-            return True
+            return {"success": True, "user_id": user_id}
         except Exception as e:
             print(f"❌ Error saving to OST collections: {str(e)}")
-            return False
+            return {"success": False, "user_id": user_id if user_id else None}
 
 ###########################################
 # AGENT FRAMEWORK LAYER
@@ -1080,11 +1092,16 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
                     state["job_field"], state["user_data"]
                 )
                 
-                # Save to OST collections
-                success = OSTDataTransformer.save_to_ost_collections(user_profile, user_preferences)
+                # Save to OST collections and get user_id
+                result = OSTDataTransformer.save_to_ost_collections(user_profile, user_preferences)
                 
-                if success:
+                if result.get("success"):
                     print("✅ Data successfully transformed and saved for OST")
+                    user_id = result.get("user_id")
+                    if user_id:
+                        # Update the profile and preferences with the saved user_id
+                        user_profile["user_id"] = user_id
+                        user_preferences["user_id"] = user_id
                 else:
                     print("⚠️ Warning: Could not save data to OST collections")
                 
@@ -1104,12 +1121,16 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
         
         def data_storage(state: ResumeWorkflowState) -> dict:
             try:
+                # Extract user_id from OST profile if available
+                user_id = state.get("ost_profile", {}).get("user_id")
+                
                 document = {
                     "workflow_id": self.config.workflow_id,
                     "job_field": state["job_field"],
                     "user_data": state["user_data"],
                     "ost_profile": state.get("ost_profile", {}),
                     "ost_preferences": state.get("ost_preferences", {}),
+                    "user_id": user_id,
                     "api_stats": {
                         "total_calls": self.meta_agent.total_calls,
                         "variables_analyzed": len(self.meta_agent.reasoning_history.history)
@@ -1124,10 +1145,13 @@ class ResumeWorkflowBuilder(BaseWorkflowBuilder):
                 
                 if success:
                     print("✅ Data stored successfully!")
+                    if user_id:
+                        print(f"👤 User ID: {user_id}")
+                        print("Use this ID in the application process to load your specific preferences.")
                 else:
                     print("⚠️ Failed to store data")
                     
-                return {}
+                return {"user_id": user_id} if user_id else {}
             except Exception as e:
                 print(f"❌ Storage Error: {str(e)}")
                 print("⚠️ Could not store data. Here's the data that would have been stored:")
@@ -1297,6 +1321,27 @@ class OSTWorkflowBuilder(BaseWorkflowBuilder):
         def load_user_data(state: OSTWorkflowState) -> dict:
             """Load user profile and preferences from OST system"""
             try:
+                # Use user_id to fetch specific user data if provided
+                user_id = state.get("user_id")
+                mongodb_util = MongoDBUtility()
+                
+                if user_id:
+                    print(f"🔍 Fetching user data for user_id: {user_id}")
+                    # Try to load user profile and preferences by user_id
+                    user_profile = mongodb_util.load_data("user_profiles", {"user_id": user_id})
+                    user_preferences = mongodb_util.load_data("user_preferences", {"user_id": user_id})
+                    
+                    # If we found both user profile and preferences, use them
+                    if user_profile and user_preferences:
+                        print(f"✅ Found user data for user_id: {user_id}")
+                        return {
+                            "user_profile": user_profile,
+                            "user_preferences": user_preferences
+                        }
+                    else:
+                        print(f"⚠️ User data not found for user_id: {user_id}, using defaults")
+                
+                # Fall back to creating profile by field if user_id not provided or data not found
                 user_profile, user_preferences = create_user_profile(state["field"])
                 
                 return {
@@ -1550,19 +1595,28 @@ def main():
             print("\n📊 OST Profile created:")
             print(f"Field: {result['ost_profile'].get('field', 'unknown')}")
             print(f"Experience level: {result['ost_profile'].get('experience_level', 'unknown')}")
+            
+            # Display user_id
+            user_id = result['ost_profile'].get('user_id')
+            if user_id:
+                print(f"\n🔑 Your User ID: {user_id}")
+                print("Save this ID to use in application_process.py for loading your preferences")
         else:
             print("\n⚠️ No OST Profile was created")
 
 
-def run_ost_evaluation(field, job_offers):
+def run_ost_evaluation(field, job_offers, user_id=None):
     """
     Run OST job evaluation standalone.
     
     Args:
         field: The professional field
         job_offers: List of job offers to evaluate
+        user_id: Optional user ID to fetch specific user preferences
     """
     print(f"📊 Running OST evaluation for field: {field}")
+    if user_id:
+        print(f"🔑 Using user ID: {user_id}")
     
     # Setup OST workflow
     registry = setup_ost_workflow()
@@ -1574,7 +1628,8 @@ def run_ost_evaluation(field, job_offers):
         "field": field,
         "job_offers": job_offers,
         "current_time": 0,  # Day 0 of job search
-        "meta_data": {"source": "command_line"}
+        "meta_data": {"source": "command_line"},
+        "user_id": user_id
     }
     
     result = executor.run_workflow("ost_workflow", initial_state)

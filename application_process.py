@@ -2503,6 +2503,13 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                 # Print for debugging
                 print(f"📊 Generated experience contexts: {experience_contexts}")
                 
+                # Extract user_id from metadata if available
+                user_id = state.get("meta_data", {}).get("user_id")
+                if user_id:
+                    # Add user_id to experience_contexts
+                    experience_contexts["user_id"] = user_id
+                    print(f"👤 Adding user_id {user_id} to experience_contexts")
+                
                 # Insert as a new document
                 mongodb_util.db["experience_contexts"].insert_one(experience_contexts)
                 
@@ -2521,6 +2528,12 @@ class ApplicationProcessingWorkflowBuilder(BaseWorkflowBuilder):
                 
                 # Store as a key-value pair where key is the location
                 location_contexts[location] = location_data
+                
+                # Extract user_id from metadata if available
+                user_id = state.get("meta_data", {}).get("user_id")
+                if user_id:
+                    # Add user_id to location_contexts
+                    location_contexts["user_id"] = user_id
                 
                 # Insert as a new document
                 mongodb_util.db["location_contexts"].insert_one(location_contexts)
@@ -2760,13 +2773,49 @@ def setup_application_processing(automated=True):
     
     return registry, config, meta_agent
 
-def process_application(application_data, user_preferences, automated=True):
+def get_user_preferences_by_id(user_id):
+    """
+    Fetch user preferences from the database based on user ID.
+    
+    Args:
+        user_id: Unique identifier for the user
+        
+    Returns:
+        User preferences dictionary or None if not found
+    """
+    from ost import MongoDBUtility
+    
+    # Initialize MongoDB utility
+    mongodb_util = MongoDBUtility()
+    
+    # Try to fetch user preferences by ID
+    if not user_id:
+        print("⚠️ No user ID provided, will use default preferences")
+        return None
+        
+    try:
+        # Try to load user preferences by user_id
+        user_preferences = mongodb_util.load_data("user_preferences", {"user_id": user_id})
+        
+        if user_preferences:
+            print(f"✅ Found user preferences for ID: {user_id}")
+            return user_preferences
+        else:
+            print(f"⚠️ No user preferences found for ID: {user_id}, will use default preferences")
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching user preferences: {str(e)}")
+        return None
+
+
+def process_application(application_data, user_preferences=None, user_id=None, automated=True):
     """
     Process a job application and assess its quality.
     
     Args:
         application_data: Basic application information
-        user_preferences: User preference variables
+        user_preferences: User preference variables (optional if user_id is provided)
+        user_id: Optional user ID to fetch specific user preferences
         automated: If True, use the automated workflow that doesn't require user input
         
     Returns:
@@ -2774,6 +2823,20 @@ def process_application(application_data, user_preferences, automated=True):
     """
     print("🚀 Setting up application processing workflow...")
     registry, config, meta_agent = setup_application_processing(automated=automated)
+    
+    # If user_id provided but no user_preferences, try to fetch from database
+    if user_id and not user_preferences:
+        fetched_preferences = get_user_preferences_by_id(user_id)
+        if fetched_preferences:
+            user_preferences = fetched_preferences
+            print("📊 Using user preferences from database")
+    
+    # If still no user_preferences, use defaults
+    if not user_preferences:
+        from ost import DEFAULT_FIELD_PREFERENCES
+        field = application_data.get("field", "software_engineering")
+        user_preferences = DEFAULT_FIELD_PREFERENCES.get(field, DEFAULT_FIELD_PREFERENCES["software_engineering"])
+        print("📊 Using default preferences for field: " + field)
     
     # Create workflow executor
     from main import WorkflowExecutor
@@ -2785,7 +2848,7 @@ def process_application(application_data, user_preferences, automated=True):
         "application_data": application_data,
         "user_preferences": user_preferences,
         "knowledge_gaps": {},  # Initialize empty knowledge gaps
-        "meta_data": {"source": "api", "automated": automated}
+        "meta_data": {"source": "api", "automated": automated, "user_id": user_id}
     }
     
     # Run the workflow
@@ -2795,6 +2858,8 @@ def process_application(application_data, user_preferences, automated=True):
     if result:
         print("✅ Application processing completed successfully!")
         print(f"📄 Application ID: {application_data.get('id', 'N/A')}")
+        if user_id:
+            print(f"👤 User ID: {user_id}")
         
         # Print overall job quality score
         overall_score = result.get("job_quality_metrics", {}).get("overall_score", {})
@@ -2862,8 +2927,21 @@ if __name__ == "__main__":
         "current_salary": 110000
     }
     
-    # Process the application with automated=True to avoid user input prompts
-    assessment_result = process_application(application_data, user_preferences, automated=True)
+    # Create a unique user ID (in real usage, this would come from the user)
+    import uuid
+    user_id = str(uuid.uuid4())  # Generate a random UUID
+    
+    # First save user preferences to the database with the user_id
+    from ost import MongoDBUtility
+    mongodb_util = MongoDBUtility()
+    user_preferences["user_id"] = user_id  # Add user_id to preferences
+    mongodb_util.save_document("user_preferences", user_preferences, {"user_id": user_id})
+    print(f"👤 Created and saved user preferences with ID: {user_id}")
+    
+    # Process the application - either providing user_preferences directly or via user_id
+    # Uncomment one of these lines:
+    assessment_result = process_application(application_data, user_preferences, user_id=user_id, automated=True)  # Provide both user_preferences and user_id
+    # assessment_result = process_application(application_data, user_id=user_id, automated=True)  # Only provide user_id to fetch from DB
     
     # Examine results
     if assessment_result and "job_quality_metrics" in assessment_result:
