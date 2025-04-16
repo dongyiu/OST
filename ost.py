@@ -1,11 +1,15 @@
 import random
+import uuid
 import numpy as np
 import datetime
 import math
+import os
+import json
+import re
+import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Tuple, Optional, Callable
 from scipy.stats import beta, norm
 import pymongo
-import os
 from dotenv import load_dotenv
 
 # ===========================================================================
@@ -2447,6 +2451,184 @@ def add_new_field(field_name: str, field_profile: Dict[str, Any], field_preferen
 # 7. SIMULATION DEMO
 # ===========================================================================
 
+def visualize_ost_results(ost, offers_data=None):
+    """
+    Visualize the OST algorithm results.
+    
+    Args:
+        ost: The SemanticOST instance
+        offers_data: List of (time, utility, threshold, decision) tuples for each offer
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Plot the reservation utilities over time
+    plt.subplot(2, 1, 1)
+    plt.plot(ost.time_grid, ost.reservation_utilities, 'b-', linewidth=2, label='Reservation Utility')
+    
+    # Add offer decision points if available
+    if offers_data:
+        accepted_t = []
+        accepted_u = []
+        rejected_t = []
+        rejected_u = []
+        thresholds = []
+        threshold_times = []
+        
+        for t, utility, threshold, accepted in offers_data:
+            if accepted:
+                accepted_t.append(t)
+                accepted_u.append(utility)
+            else:
+                rejected_t.append(t)
+                rejected_u.append(utility)
+            threshold_times.append(t)
+            thresholds.append(threshold)
+        
+        plt.scatter(rejected_t, rejected_u, color='red', s=80, label='Rejected Offers', marker='x')
+        if accepted_t:
+            plt.scatter(accepted_t, accepted_u, color='green', s=100, label='Accepted Offer', marker='o')
+        plt.scatter(threshold_times, thresholds, color='purple', s=60, label='Threshold at Decision', marker='_')
+    
+    plt.xlabel('Time (years)')
+    plt.ylabel('Utility')
+    plt.title('Reservation Utility Threshold Over Time')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot market conditions and other factors over time if available
+    plt.subplot(2, 1, 2)
+    
+    # Generate market conditions for visualization
+    market_times = np.linspace(0, ost.max_time, 50)
+    market_values = [ost.belief_model.get_market_condition(t) for t in market_times]
+    plt.plot(market_times, market_values, 'g-', label='Market Condition')
+    
+    # Add other factors
+    time_factors = [ost._get_time_factor(t) for t in market_times]
+    runway_factors = [ost._get_runway_factor(t) for t in market_times]
+    
+    plt.plot(market_times, time_factors, 'r--', label='Time Factor')
+    plt.plot(market_times, runway_factors, 'b--', label='Runway Factor')
+    
+    plt.xlabel('Time (years)')
+    plt.ylabel('Factor Value')
+    plt.title('Contextual Factors Affecting Decisions')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
+def visualize_decision_process(ost, verbose=True):
+    """
+    Visualize the decision process of the OST algorithm with a step-by-step breakdown.
+    
+    Args:
+        ost: The SemanticOST instance
+        verbose: Whether to print detailed explanation
+    """
+    # Create a set of synthetic offers at different time points
+    time_points = np.linspace(0.1, 0.9, 6)
+    offers = []
+    
+    if verbose:
+        print("\n=== DECISION PROCESS VISUALIZATION ===")
+        print("Generating synthetic offers to demonstrate the decision process...")
+    
+    # Generate a range of offers (some above threshold, some below)
+    for i, t in enumerate(time_points):
+        # Generate an offer from the belief model
+        offer = ost.belief_model.generate_job_offer(t)
+        
+        # Calculate the utility
+        utility = ost.preference_processor.calculate_offer_utility(offer)
+        
+        # Get the threshold at this time
+        threshold = ost.get_reservation_utility(t)
+        
+        # Store the offer with its decision metrics
+        offers.append({
+            'time': t,
+            'offer': offer,
+            'utility': utility,
+            'threshold': threshold,
+            'accept': utility >= threshold,
+            'company': offer['company'],
+            'salary': offer['base_salary']
+        })
+        
+        if verbose:
+            if i == 0:
+                print(f"\nOffer 1 (t={t:.2f}):")
+                print(f"  Company: {offer['company']}")
+                print(f"  Salary: ${offer['base_salary']:,.2f}")
+                print(f"  Utility: {utility:.2f}")
+                print(f"  Threshold: {threshold:.2f}")
+                print(f"  Decision: {'ACCEPT' if utility >= threshold else 'REJECT'}")
+                print("\nDecision Factors Analysis:")
+                print(f"  Market condition: {ost.belief_model.get_market_condition(t):.2f}")
+                print(f"  Time factor: {ost._get_time_factor(t):.2f}")
+                print(f"  Risk factor: {ost._get_risk_factor():.2f}")
+                print(f"  Runway factor: {ost._get_runway_factor(t):.2f}")
+    
+    # Create visualization
+    plt.figure(figsize=(12, 10))
+    
+    # Plot 1: The offers and thresholds
+    plt.subplot(2, 1, 1)
+    
+    # Plot the reservation utility curve
+    plt.plot(ost.time_grid, ost.reservation_utilities, 'b-', linewidth=2, label='Threshold')
+    
+    # Plot the offers
+    accepted_t = [o['time'] for o in offers if o['accept']]
+    accepted_u = [o['utility'] for o in offers if o['accept']]
+    rejected_t = [o['time'] for o in offers if not o['accept']]
+    rejected_u = [o['utility'] for o in offers if not o['accept']]
+    
+    plt.scatter(rejected_t, rejected_u, color='red', s=100, label='Rejected Offers', marker='x')
+    plt.scatter(accepted_t, accepted_u, color='green', s=120, label='Accepted Offers', marker='o')
+    
+    # Add annotations for offers
+    for i, o in enumerate(offers):
+        label = f"{i+1}: {o['company']}\n${o['salary']/1000:.0f}k"
+        plt.annotate(label, (o['time'], o['utility']), 
+                    textcoords="offset points", 
+                    xytext=(0, 10), 
+                    ha='center')
+    
+    plt.xlabel('Time (years)')
+    plt.ylabel('Utility')
+    plt.title('Offer Evaluation Against Changing Threshold')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot 2: The components that affect the threshold
+    plt.subplot(2, 1, 2)
+    
+    times = np.linspace(0, ost.max_time, 50)
+    
+    # Plot each factor that affects the threshold
+    market_conditions = [ost.belief_model.get_market_condition(t) for t in times]
+    time_factors = [ost._get_time_factor(t) for t in times]
+    runway_factors = [ost._get_runway_factor(t) for t in times]
+    risk_factor = ost._get_risk_factor()
+    risk_factors = [risk_factor] * len(times)
+    
+    plt.plot(times, market_conditions, 'g-', linewidth=2, label='Market Condition')
+    plt.plot(times, time_factors, 'r-', linewidth=2, label='Time Pressure')
+    plt.plot(times, runway_factors, 'b-', linewidth=2, label='Financial Runway')
+    plt.plot(times, risk_factors, 'k--', linewidth=1, label='Risk Tolerance')
+    
+    plt.xlabel('Time (years)')
+    plt.ylabel('Factor Value')
+    plt.title('Factors Affecting Decision Threshold')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
 def run_semantic_ost_simulation():
     """Run a simulation of the semantic OST algorithm."""
     print("=== SEMANTIC OPTIMAL STOPPING THEORY SIMULATION ===\n")
@@ -2492,6 +2674,9 @@ def run_semantic_ost_simulation():
     # MODIFICATION 15: Generate more offers and ensure they're spread out over time
     num_offers = random.randint(8, 12)  # More offers to test with
     accepted = False
+    
+    # Track offers for visualization
+    offers_data = []
     
     for i in range(num_offers):
         # Distribute offers throughout the search period, with exact timing based on offer number
@@ -2565,6 +2750,9 @@ def run_semantic_ost_simulation():
         
         # Make decision with semantic understanding
         should_accept, reason, details = ost.should_accept_offer(offer, t)
+        
+        # Track this offer for visualization
+        offers_data.append((t, utility, details['threshold'], should_accept))
         
         # Print decision details
         print(f"Current threshold: {details['threshold']:.2f}")
@@ -2695,8 +2883,14 @@ def run_semantic_ost_simulation():
     # Recommend creating a .env file if MongoDB connection failed
     if not hasattr(mongodb_util, 'connected') or not mongodb_util.connected:
         print("\nTIP: To use MongoDB for data persistence, create a .env file with:")
-        print("MONGO_URI=your_connection_string")
+        print("MONGODB_URI=your_mongodb_connection_string")
+    
+    # Visualize the results
+    print("\nGenerating visualization of the OST algorithm results...")
+    visualize_ost_results(ost, offers_data)
+    
+    # Remove the separate call to visualize_decision_process to avoid duplicate visualization
 
-# Run the simulation
+# Run the simulation or evaluation based on command line args
 if __name__ == "__main__":
     run_semantic_ost_simulation()
