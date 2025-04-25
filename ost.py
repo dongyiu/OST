@@ -1868,10 +1868,6 @@ class SemanticOST:
     
     def _calculate_reservation_utility(self, t: float, continuing_value: float) -> float:
         """Calculate reservation utility with semantic understanding."""
-        # MODIFICATION 13: Complete redesign of reservation utility calculation
-        # Instead of using continuing_value (which has numerical issues),
-        # calculate based on mean utility of sample offers
-        
         # Generate sample offers to get baseline statistics
         n_samples = 30
         sample_offers = [self.belief_model.generate_job_offer(t) for _ in range(n_samples)]
@@ -1880,8 +1876,8 @@ class SemanticOST:
         # Sort utilities to find distribution
         sorted_utilities = sorted(sample_utilities)
         
-        # Use 40th percentile as baseline reservation utility (somewhat selective)
-        percentile_idx = int(0.4 * len(sorted_utilities))
+        # Use 38th percentile as baseline reservation utility (moderately selective)
+        percentile_idx = int(0.38 * len(sorted_utilities))  # Changed from 0.35 to 0.38
         base_reservation = sorted_utilities[percentile_idx]
         
         # Get context-aware market condition
@@ -1901,15 +1897,15 @@ class SemanticOST:
                         market_factor * rejection_factor * field_factor * \
                         experience_factor
         
-        # MODIFICATION 5: Boost reservation utility directly
-        adjusted_utility += 3.0  # Add a flat boost to make more selective
+        # Small boost to make slightly more selective
+        adjusted_utility += 1.5  # Increased from 1.0 to 1.5
         
         # Lower bound based on risk tolerance and employment status
         if self.employment_status == 'unemployed':
             # Lower floor when unemployed - can't be as selective
-            min_acceptable = 0.6 * (2 - self.risk_tolerance) 
+            min_acceptable = 0.55 * (2 - self.risk_tolerance)  # Increased from 0.5 to 0.55
         else:
-            min_acceptable = 2 * (1 - self.risk_tolerance)
+            min_acceptable = 1.8 * (1 - self.risk_tolerance)
         
         # Debug output for this calculation
         # if t < 0.1:  # Only for early time points
@@ -1940,25 +1936,17 @@ class SemanticOST:
             return 1.0  # Neutral
     
     def _get_time_factor(self, t: float) -> float:
-        """Get time adjustment factor with field-specific considerations."""
-        # MODIFICATION 8: Make time effect more beneficial
-        if t < 0.3 * self.max_time:
-            # Stay more selective longer in early phase
-            time_factor = 1.5  # Increased from 1.2
-        elif t > 0.9 * self.max_time:
-            # Only reduce selectivity at very end
-            time_factor = 0.8
+        """Get time-based adjustment factor with semantic understanding."""
+        # Time pressure increases as search progresses
+        normalized_time = t / self.max_time
+        
+        # More moderate decrease for unemployed job seekers
+        if self.employment_status == 'unemployed':
+            # Moderate decrease
+            return max(0.6, 1.0 - (normalized_time * 0.7))  # Changed from 0.9 to 0.7
         else:
-            time_factor = 1.2  # Stay more selective in middle phase
-        
-        # Field-specific adjustments
-        field = self.user_profile.get('field', 'general')
-        if field == 'seasonal':
-            # For highly seasonal fields, timing is more important
-            if t < 0.2 * self.max_time or t > 0.8 * self.max_time:
-                time_factor *= 1.2
-        
-        return time_factor
+            # Employed can afford to be more patient
+            return max(0.8, 1.0 - (normalized_time * 0.4))  # Changed from 0.6 to 0.4
     
     def _get_runway_factor(self, t: float) -> float:
         """Get financial runway adjustment factor with semantic understanding."""
@@ -2008,6 +1996,9 @@ class SemanticOST:
         elif field == 'academic':
             # Academic jobs are scarce - be less selective
             return 0.9
+        elif field == 'marketing':
+            # Marketing should be moderately less selective
+            return 0.9  # Changed from 0.8 to 0.9
         else:
             return 1.0
     
@@ -2332,16 +2323,16 @@ DEFAULT_FIELD_PREFERENCES = {
     },
     "marketing": {
         "field": "marketing",
-        "current_salary": 95000,
-        "min_salary": 85000,
+        "current_salary": 92000,  # Moderately lower than original 95000
+        "min_salary": 82000,      # Moderately lower than original 85000
         "financial_runway": 12,
-        "risk_tolerance": 9,
-        "job_search_urgency": 8,
-        "compensation_weight": 4,
-        "career_growth_weight": 5,
+        "risk_tolerance": 9,      # Keep original value
+        "job_search_urgency": 8,  # Keep original value
+        "compensation_weight": 4,  # Keep original value
+        "career_growth_weight": 5, # Keep original value
         "work_life_balance_weight": 3,
-        "company_reputation_weight": 5,
-        "remote_work_weight": 2,
+        "company_reputation_weight": 5, # Keep original value
+        "remote_work_weight": 2,   # Keep original value
         "role_responsibilities_weight": 4
     }
 }
@@ -2631,6 +2622,55 @@ def visualize_decision_process(ost, verbose=True):
 
 def run_semantic_ost_simulation():
     """Run a simulation of the semantic OST algorithm."""
+    # Run multiple simulations to see different outcomes
+    for simulation_run in range(3):
+        print(f"=== SEMANTIC OPTIMAL STOPPING THEORY SIMULATION (RUN {simulation_run+1}/3) ===\n")
+        
+        # Choose a profile
+        field_options = list(DEFAULT_FIELD_PROFILES.keys())
+        profile_choice = "marketing"  # Force marketing profile for comparison
+        
+        # Create user profile using the generic function
+        user_profile, user_preferences = create_user_profile(profile_choice)
+        
+        # Determine display name for the field
+        field_display_names = {
+            "software_engineering": "Software Engineer",
+            "marketing": "Marketing Professional"
+        }
+        display_name = field_display_names.get(profile_choice, profile_choice.capitalize())
+        print(f"Using {display_name} profile")
+        
+        print("\nUser profile:")
+        for key, value in sorted(user_profile.items()):
+            print(f"  {key}: {value}")
+        
+        print("\nUser preferences:")
+        for key, value in sorted(user_preferences.items()):
+            print(f"  {key}: {value}")
+        
+        # Initialize Semantic OST
+        ost = SemanticOST(user_profile, user_preferences, max_time=1.0, time_units="years")
+        
+        print("\nOST Model initialized with contextual parameters:")
+        print(f"  Field: {user_profile['field']}")
+        print(f"  Experience: {user_profile['experience_level']}")
+        print(f"  Location: {user_profile['location']}")
+        print(f"  Employment status: {user_profile['employment_status']}")
+        print(f"  Financial runway: {ost.financial_runway:.2f} years")
+        print(f"  Expected salary: ${ost.belief_model.context['expected_salary']:,.2f}")
+        print(f"  Initial reservation utility: {ost.reservation_utilities[0]:.2f}")
+        
+        # Simulate offer evaluation
+        print("\nPROCESSING OFFERS WITH SEMANTIC UNDERSTANDING...")
+        
+        # MODIFICATION 15: Generate more offers and ensure they're spread out over time
+        num_offers = random.randint(8, 12)  # More offers to test with
+        accepted = False
+        
+        # Track offers for visualization
+        offers_data = []
+        
     print("=== SEMANTIC OPTIMAL STOPPING THEORY SIMULATION ===\n")
     
     # Choose a profile

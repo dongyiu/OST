@@ -10,6 +10,7 @@ from collections import defaultdict
 from datetime import datetime
 import re
 from langgraph.graph import StateGraph
+import google.generativeai as genai
 # Import from main.py (the refactored code)
 from main import (
     BaseWorkflowState, 
@@ -36,7 +37,7 @@ class ApplicationState(BaseWorkflowState):
     reasoning_traces: List[Dict]  # Traces of reasoning steps
     knowledge_gaps: Dict  # Identified information gaps that need research
 
-
+genai.configure(api_key="AIzaSyBGkvO4s4WlZ2p3bwZwxWxkKnueRm6npRU")
 class JobQualityMetric:
     """Definition of a job quality metric"""
     def __init__(self, 
